@@ -813,6 +813,16 @@ private:
                 llama_set_eagle3(ctx, model_dft.get());
                 SRV_INF("%s", "EAGLE3 feature extraction enabled on target model\n");
             }
+
+            if (params_base.speculative.dflash) {
+                // DFlash current limitation: extracted target features are per-context; multiple slots would overwrite each other
+                if (params_base.n_parallel > 1) {
+                    SRV_ERR("%s", "DFlash speculative decoding is not supported with n_parallel > 1\n");
+                    return false;
+                }
+                llama_set_dflash(ctx, model_dft.get());
+                SRV_INF("%s", "DFlash feature extraction enabled on target model\n");
+            }
         }
 
         std::string & mmproj_path = params_base.mmproj.path;
