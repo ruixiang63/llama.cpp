@@ -930,6 +930,9 @@ extern "C" {
             const struct llama_model * model);
 
     LLAMA_API const float * llama_get_dflash_target_features(struct llama_context * ctx);
+    LLAMA_API int32_t       llama_get_dflash_target_features_n_tokens(struct llama_context * ctx);
+    LLAMA_API int32_t       llama_get_dflash_target_features_embd_dim(struct llama_context * ctx);
+    LLAMA_API void          llama_reset_dflash_target_features(struct llama_context * ctx);
 
     // Set accumulated target_ctx for DFlash decoder
     LLAMA_API void llama_set_dflash_accumulated_target_ctx(

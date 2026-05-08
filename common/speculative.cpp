@@ -14,6 +14,7 @@
 #include <iomanip>
 #include <map>
 #include <cinttypes>
+#include <cmath>
 
 #define SPEC_VOCAB_MAX_SIZE_DIFFERENCE  128
 #define SPEC_VOCAB_CHECK_START_TOKEN_ID 5
@@ -763,6 +764,9 @@ struct common_speculative_state_dflash : public common_speculative_state {
 
     void begin(const llama_tokens & prompt) override {
         GGML_UNUSED(prompt);
+        dflash_n_past = 0;
+        accumulated_ctx.clear();
+        llama_memory_seq_rm(llama_get_memory(ctx_dft_dec), 0, 0, -1);
     }
 
     void draft(
@@ -780,32 +784,52 @@ struct common_speculative_state_dflash : public common_speculative_state {
         GGML_ASSERT(n >= 1 && "prompt_tgt is empty");
         GGML_ASSERT(n_new >= 1 && "must have at least 1 new token");
 
-        // Step 1: Encode new accepted tokens' features
-        const float * features = llama_get_dflash_target_features(ctx_tgt);
+        // Step 1: Encode only the n_new newly accepted tokens' features.
+        // target_features is reset after each draft call so it contains only the features
+        // from the most recent target decode batch (prefill or verification block).
+        // For a verification block of block_size tokens, we take only the first n_new
+        // features which correspond to the accepted tokens in sequence order.
+        const float * features       = llama_get_dflash_target_features(ctx_tgt);
+        const int     n_feat_tokens  = llama_get_dflash_target_features_n_tokens(ctx_tgt);
+        const int     n_embd_enc     = llama_get_dflash_target_features_embd_dim(ctx_tgt);
+        const int     n_ubatch       = llama_n_ubatch(ctx_dft_enc);
+        const int     n_to_encode    = std::min(n_new, n_feat_tokens);
 
-        llama_batch enc_batch = {
-            /*.n_tokens  =*/ n_new,
-            /*.token     =*/ nullptr,
-            /*.embd      =*/ const_cast<float*>(features),
-            /*.pos       =*/ nullptr,
-            /*.n_seq_id  =*/ nullptr,
-            /*.seq_id    =*/ nullptr,
-            /*.logits    =*/ nullptr,
-        };
-        if (llama_encode(ctx_dft_enc, enc_batch) != 0) {
-            LOG_ERR("DFlash: encoder failed\n");
-            return;
+        std::vector<float> enc_out_buf;
+        enc_out_buf.reserve((size_t)n_embd * n_to_encode);
+
+        for (int chunk_start = 0; chunk_start < n_to_encode; chunk_start += n_ubatch) {
+            const int chunk_size = std::min(n_ubatch, n_to_encode - chunk_start);
+            llama_batch enc_batch = {
+                /*.n_tokens  =*/ chunk_size,
+                /*.token     =*/ nullptr,
+                /*.embd      =*/ const_cast<float*>(features) + chunk_start * n_embd_enc,
+                /*.pos       =*/ nullptr,
+                /*.n_seq_id  =*/ nullptr,
+                /*.seq_id    =*/ nullptr,
+                /*.logits    =*/ nullptr,
+            };
+            if (llama_encode(ctx_dft_enc, enc_batch) != 0) {
+                LOG_ERR("DFlash: encoder failed\n");
+                return;
+            }
+            const float * chunk_out = llama_get_embeddings(ctx_dft_enc);
+            GGML_ASSERT(chunk_out && "encoder output is null");
+            enc_out_buf.insert(enc_out_buf.end(), chunk_out, chunk_out + (size_t)n_embd * chunk_size);
         }
 
-        const float * target_ctx_new = llama_get_embeddings(ctx_dft_enc);
-        GGML_ASSERT(target_ctx_new && "encoder output is null");
-
         // Step 2: Append to accumulated target_ctx and set on decoder context (writes to cross.v_embd)
-        const size_t new_size = (size_t)n_embd * n_new;
-        accumulated_ctx.insert(accumulated_ctx.end(), target_ctx_new, target_ctx_new + new_size);
+        accumulated_ctx.insert(accumulated_ctx.end(), enc_out_buf.begin(), enc_out_buf.end());
 
+        // Reset so the next draft call only sees features from the next verification decode
+        llama_reset_dflash_target_features(ctx_tgt);
+
+        // Cap to decoder context capacity — use the most recent n_ctx_dec tokens
+        const int n_ctx_dec   = (int)llama_n_ctx(ctx_dft_dec);
         const int n_ctx_total = (int)(accumulated_ctx.size() / n_embd);
-        llama_set_dflash_accumulated_target_ctx(ctx_dft_dec, accumulated_ctx.data(), n_embd, n_ctx_total);
+        const int n_ctx_use   = std::min(n_ctx_total, n_ctx_dec);
+        const int offset      = n_ctx_total - n_ctx_use;
+        llama_set_dflash_accumulated_target_ctx(ctx_dft_dec, accumulated_ctx.data() + (size_t)offset * n_embd, n_embd, n_ctx_use);
 
         // Step 3: Decode noise block
         const llama_token mask_token_id = llama_model_dflash_mask_token_id(llama_get_model(ctx_dft_dec));

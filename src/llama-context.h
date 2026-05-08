@@ -235,6 +235,15 @@ public:
     // DFlash: Get pointer to target model features extracted for DFlash encoder
     const float * get_dflash_target_features() const;
 
+    // DFlash: Number of tokens in the accumulated target features buffer
+    int32_t get_dflash_target_features_n_tokens() const;
+
+    // DFlash: Per-token feature dimension (n_layers * n_embd) — stride for indexing the features buffer
+    int32_t get_dflash_target_features_embd_dim() const;
+
+    // DFlash: Clear accumulated target features (call at start of each request)
+    void reset_dflash_target_features();
+
     // DFlash: Set accumulated target_ctx from encoder output for decoder input
     void set_dflash_accumulated_target_ctx(const float * data, int32_t n_embd, int32_t n_tokens);
 
