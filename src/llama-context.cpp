@@ -1236,6 +1236,13 @@ const float * llama_context::get_dflash_target_features() const {
     return dflash.target_features.data();
 }
 
+int32_t llama_context::get_dflash_target_features_n_tokens() const {
+    const int64_t n_embd  = model.hparams.n_embd;
+    const size_t  n_layers = dflash.extract_tensors.size();
+    const int64_t n_embd_concat = n_embd * (n_layers > 0 ? (int64_t)n_layers : 1);
+    return (int32_t)(dflash.target_features.size() / n_embd_concat);
+}
+
 void llama_context::set_dflash_accumulated_target_ctx(const float * data, int32_t n_embd, int32_t n_tokens) {
     GGML_ASSERT(data != nullptr);
     const size_t size = (size_t)n_embd * n_tokens;
@@ -2496,9 +2503,18 @@ void llama_context::extract_dflash_features(const llama_ubatch & ubatch) {
     const size_t n_layers = dflash.extract_tensors.size();
 
     const int64_t n_embd_concat = n_embd * n_layers;
-    dflash.target_features.resize(n_embd_concat * n_tokens);
+    // A fresh sequence always starts at position 0.  Reset the accumulator so
+    // we don't carry over stale features from a previous request.
+    if (ubatch.pos && ubatch.pos[0] == 0) {
+        dflash.target_features.clear();
+    }
+    // Append to existing features instead of overwriting so that features
+    // accumulate correctly across multiple ubatches in a single request.
+    const size_t prev_size = dflash.target_features.size();
+    dflash.target_features.resize(prev_size + n_embd_concat * n_tokens);
 
-    static thread_local std::vector<float> temp_layer_features;
+    static thread_local std::vector<float>       temp_layer_features;
+    static thread_local std::vector<ggml_fp16_t> temp_layer_features_f16;
     temp_layer_features.resize(n_embd * n_tokens);
 
     LLAMA_LOG_DEBUG("%s: Start to extract DFlash features: %zu layers, %lld tokens, %lld embd\n",
@@ -2514,16 +2530,37 @@ void llama_context::extract_dflash_features(const llama_ubatch & ubatch) {
         GGML_ASSERT(tensor->ne[0] == n_embd && tensor->ne[1] == n_tokens &&
                     "DFlash extraction tensor has unexpected shape");
 
-        const size_t size_bytes = n_embd * n_tokens * sizeof(float);
-        ggml_backend_tensor_get_async(backend, tensor, temp_layer_features.data(), 0, size_bytes);
-        ggml_backend_sched_synchronize(sched.get());
+        const int64_t n_elements = n_embd * n_tokens;
+        if (tensor->type == GGML_TYPE_F32) {
+            ggml_backend_tensor_get_async(backend, tensor, temp_layer_features.data(), 0, n_elements * sizeof(float));
+            ggml_backend_sched_synchronize(sched.get());
+        } else if (tensor->type == GGML_TYPE_F16) {
+            temp_layer_features_f16.resize(n_elements);
+            ggml_backend_tensor_get_async(backend, tensor, temp_layer_features_f16.data(), 0, n_elements * sizeof(ggml_fp16_t));
+            ggml_backend_sched_synchronize(sched.get());
+            ggml_fp16_to_fp32_row(temp_layer_features_f16.data(), temp_layer_features.data(), n_elements);
+        } else {
+            GGML_ABORT("DFlash: unsupported extraction tensor type %d at layer %zu", (int)tensor->type, layer_idx);
+        }
 
         for (int64_t token_idx = 0; token_idx < n_tokens; ++token_idx) {
             const float * src = temp_layer_features.data() + token_idx * n_embd;
-            float * dest = dflash.target_features.data() + token_idx * n_embd_concat + layer_idx * n_embd;
+            float * dest = dflash.target_features.data() + prev_size + token_idx * n_embd_concat + layer_idx * n_embd;
             std::memcpy(dest, src, n_embd * sizeof(float));
         }
     }
+}
+
+void llama_context::reset_dflash_target_features() {
+    dflash.target_features.clear();
+}
+
+int32_t llama_context::get_dflash_target_features_embd_dim() const {
+    const size_t n_layers = dflash.extract_tensors.size();
+    if (n_layers == 0) {
+        return (int32_t)model.hparams.n_embd;
+    }
+    return (int32_t)(model.hparams.n_embd * n_layers);
 }
 
 //
@@ -3888,6 +3925,18 @@ void llama_set_eagle3_g_embeddings(llama_context * ctx, const float * g_embd, in
 
 const float * llama_get_dflash_target_features(llama_context * ctx) {
     return ctx->get_dflash_target_features();
+}
+
+int32_t llama_get_dflash_target_features_n_tokens(llama_context * ctx) {
+    return ctx->get_dflash_target_features_n_tokens();
+}
+
+void llama_reset_dflash_target_features(llama_context * ctx) {
+    ctx->reset_dflash_target_features();
+}
+
+int32_t llama_get_dflash_target_features_embd_dim(llama_context * ctx) {
+    return ctx->get_dflash_target_features_embd_dim();
 }
 
 void llama_set_dflash_accumulated_target_ctx(llama_context * ctx, const float * data, int32_t n_embd, int32_t n_tokens) {

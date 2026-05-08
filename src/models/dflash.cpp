@@ -19,6 +19,10 @@ ggml_tensor * llm_build_dflash_encode::build_inp_embd() const {
 llm_build_dflash_encode::llm_build_dflash_encode(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
     ggml_tensor * cur = build_inp_embd();
 
+    // Scale input down to prevent F16 accumulation overflow in the FC matmul.
+    // The subsequent RMSNorm is scale-invariant so the output is unchanged.
+    cur = ggml_scale(ctx0, cur, 1.0f/32.0f);
+
     cur = build_lora_mm(model.fc, cur);
     cb(cur, "fc_out", -1);
 
