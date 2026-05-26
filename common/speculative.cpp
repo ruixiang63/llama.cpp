@@ -449,10 +449,11 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
 
         extract_layers   = llama_model_target_extract_layers  (model_dft);
         n_extract_layers = llama_model_n_target_extract_layers(model_dft);
-        if (n_extract_layers != 3) {
-            throw std::runtime_error("draft model is not eagle3 (expected 3 extract layers, got " +
+        if (!(extract_layers != nullptr && n_extract_layers > 0)) {
+            throw std::runtime_error("draft model is not eagle3 (expected at least 1 extract layer, got " +
                                      std::to_string(n_extract_layers) + ")");
         }
+        LOG_INF("%s: - n_extract_layers=%d\n", __func__, n_extract_layers);
 
         tgt_hidden = (int32_t) llama_model_target_hidden_size(model_dft);
         if (tgt_hidden != llama_model_n_embd(model_tgt)) {

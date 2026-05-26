@@ -6,13 +6,14 @@ void llama_model_eagle3::load_arch_hparams(llama_model_loader & ml) {
     if (!ml.get_arr(LLM_KV_EAGLE3_EXTRACT_LAYERS, target_extract_layers, false)) {
         throw std::runtime_error("EAGLE3 model requires 'extract_layers' in GGUF metadata");
     }
-    if (target_extract_layers.size() != 3) {
-        throw std::runtime_error("EAGLE3 requires exactly 3 entries in 'extract_layers'");
+    if (target_extract_layers.size() == 0) {
+        throw std::runtime_error("EAGLE3 requires at least 1 entry in 'extract_layers'");
     }
-    LLAMA_LOG_INFO("%s: EAGLE3 extract_layers = [%d, %d, %d]\n", __func__,
-            target_extract_layers[0],
-            target_extract_layers[1],
-            target_extract_layers[2]);
+    std::string layers_str;
+    for (size_t i = 0; i < target_extract_layers.size(); ++i) {
+        layers_str += (i ? ", " : "") + std::to_string(target_extract_layers[i]);
+    }
+    LLAMA_LOG_INFO("%s: EAGLE3 extract_layers = [%s]\n", __func__, layers_str.c_str());
 
     ml.get_key(LLM_KV_EAGLE3_TARGET_HIDDEN_SIZE, hparams.target_hidden_size);
     LLAMA_LOG_INFO("%s: EAGLE3 target_hidden_size = %u (draft n_embd = %u)\n", __func__,
