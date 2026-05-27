@@ -562,6 +562,9 @@ struct llama_model {
     struct ggml_tensor * fc  = nullptr;  // feature fusion layer
     struct ggml_tensor * d2t = nullptr;  // draft to target vocabulary mapping
 
+    // eagle3: one RMSNorm per extracted target layer, applied before fc
+    std::vector<struct ggml_tensor *> eagle3_fc_norm;
+
     // unified vector to store target-model extracted layer ids in eagle3, dflash, etc.
     std::vector<int32_t> target_extract_layers;
 

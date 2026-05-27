@@ -231,8 +231,11 @@ private:
     int64_t output_resolve_row(int32_t i) const;
 
     // async-copy enabled layer-input tensors (per cparams.output_layer_inp)
-    // from backend into host-side embd_layer_inp buffers
-    void extract_layer_inputs(const llm_graph_result * res);
+    // from backend into host-side embd_layer_inp buffers.
+    // the buffer holds the whole batch ([n_tokens_all] rows); each ubatch is
+    // written at its running offset n_tokens_prev so multi-ubatch decodes
+    // accumulate instead of overwriting (mirrors the logits/pre-norm paths).
+    void extract_layer_inputs(const llm_graph_result * res, uint32_t n_tokens_prev, uint32_t n_tokens_all);
 
     //
     // graph

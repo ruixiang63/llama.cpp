@@ -289,6 +289,8 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_EAGLE3_EXTRACT_LAYERS,        "%s.extract_layers"        },
     { LLM_KV_EAGLE3_TARGET_HIDDEN_SIZE,    "%s.target_hidden_size"    },
     { LLM_KV_EAGLE3_NORM_BEFORE_RESIDUAL,  "%s.norm_before_residual"  },
+    { LLM_KV_EAGLE3_FC_NORM,               "%s.fc_norm"               },
+    { LLM_KV_EAGLE3_NORM_OUTPUT,           "%s.norm_output"           },
 
     { LLM_KV_SHORTCONV_L_CACHE, "%s.shortconv.l_cache" },
     // sentence-transformers dense modules feature dims
@@ -555,6 +557,7 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
     { LLM_TENSOR_INDEXER_ATTN_Q_B,                       "blk.%d.indexer.attn_q_b" },
     { LLM_TENSOR_EAGLE3_HIDDEN_NORM,                     "blk.%d.hidden_norm" },
     { LLM_TENSOR_EAGLE3_FC,                              "fc" },
+    { LLM_TENSOR_EAGLE3_FC_NORM,                         "fc_norm" },
     { LLM_TENSOR_EAGLE3_D2T,                             "d2t" },
 };
 
@@ -779,6 +782,7 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
     {LLM_TENSOR_FFN_LATENT_UP,              {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
     // eagle3
     {LLM_TENSOR_EAGLE3_FC,                  {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_EAGLE3_FC_NORM,             {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL}},
     {LLM_TENSOR_EAGLE3_HIDDEN_NORM,         {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
     {LLM_TENSOR_EAGLE3_D2T,                 {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_GET_ROWS}},
 };

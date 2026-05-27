@@ -6,13 +6,14 @@ void llama_model_eagle3::load_arch_hparams(llama_model_loader & ml) {
     if (!ml.get_arr(LLM_KV_EAGLE3_EXTRACT_LAYERS, target_extract_layers, false)) {
         throw std::runtime_error("EAGLE3 model requires 'extract_layers' in GGUF metadata");
     }
-    if (target_extract_layers.size() != 3) {
-        throw std::runtime_error("EAGLE3 requires exactly 3 entries in 'extract_layers'");
+    if (target_extract_layers.size() == 0) {
+        throw std::runtime_error("EAGLE3 requires at least 1 entry in 'extract_layers'");
     }
-    LLAMA_LOG_INFO("%s: EAGLE3 extract_layers = [%d, %d, %d]\n", __func__,
-            target_extract_layers[0],
-            target_extract_layers[1],
-            target_extract_layers[2]);
+    std::string layers_str;
+    for (size_t i = 0; i < target_extract_layers.size(); ++i) {
+        layers_str += (i ? ", " : "") + std::to_string(target_extract_layers[i]);
+    }
+    LLAMA_LOG_INFO("%s: EAGLE3 extract_layers = [%s]\n", __func__, layers_str.c_str());
 
     ml.get_key(LLM_KV_EAGLE3_TARGET_HIDDEN_SIZE, hparams.target_hidden_size);
     LLAMA_LOG_INFO("%s: EAGLE3 target_hidden_size = %u (draft n_embd = %u)\n", __func__,
@@ -25,6 +26,18 @@ void llama_model_eagle3::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_EAGLE3_NORM_BEFORE_RESIDUAL, hparams.eagle3_norm_before_residual, false);
     if (hparams.eagle3_norm_before_residual) {
         LLAMA_LOG_INFO("%s: EAGLE3 norm_before_residual = true\n", __func__);
+    }
+
+    // eagle3 fc_norm (optional, default false): per-extract-layer norm before fc
+    ml.get_key(LLM_KV_EAGLE3_FC_NORM, hparams.eagle3_fc_norm, false);
+    if (hparams.eagle3_fc_norm) {
+        LLAMA_LOG_INFO("%s: EAGLE3 fc_norm = true\n", __func__);
+    }
+
+    // eagle3 norm_output (optional, default false): capture target hidden states post input-norm
+    ml.get_key(LLM_KV_EAGLE3_NORM_OUTPUT, hparams.eagle3_norm_output, false);
+    if (hparams.eagle3_norm_output) {
+        LLAMA_LOG_INFO("%s: EAGLE3 norm_output = true (target captures post-input-norm)\n", __func__);
     }
 
     type = LLM_TYPE_UNKNOWN;
@@ -51,6 +64,16 @@ void llama_model_eagle3::load_arch_tensors(llama_model_loader &) {
 
     // Feature fusion layer: projects 3 target layers to draft hidden size
     fc = create_tensor(tn(LLM_TENSOR_EAGLE3_FC, "weight"), {n_embd_target_features, n_embd}, 0);
+
+    if (hparams.eagle3_fc_norm) {
+        eagle3_fc_norm.resize(target_extract_layers.size(), nullptr);
+        for (size_t k = 0; k < target_extract_layers.size(); ++k) {
+            const std::string suffix = std::to_string(k) + ".weight";
+            eagle3_fc_norm[k] = create_tensor(
+                tn(LLM_TENSOR_EAGLE3_FC_NORM, suffix.c_str()),
+                {(int64_t) hparams.target_hidden_size}, 0);
+        }
+    }
 
     // Output layer (uses draft vocab size)
     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
@@ -130,6 +153,31 @@ llama_model_eagle3::graph<true>::graph(const llama_model & model, const llm_grap
     ggml_tensor * cur = nullptr;
 
     cur = build_inp_embd_enc();
+
+    if (hparams.eagle3_fc_norm && !model.eagle3_fc_norm.empty()) {
+        const int64_t H = (int64_t) hparams.target_hidden_size;
+        const int64_t n_extract = (int64_t) model.target_extract_layers.size();
+        GGML_ASSERT((int64_t) model.eagle3_fc_norm.size() == n_extract);
+
+        std::vector<ggml_tensor *> parts;
+        parts.reserve(n_extract);
+        for (int64_t k = 0; k < n_extract; ++k) {
+            ggml_tensor * chunk = ggml_view_2d(
+                ctx0, cur,
+                /*ne0*/ H, /*ne1*/ n_tokens,
+                /*nb1*/ cur->nb[1],
+                /*offset*/ (size_t) k * H * ggml_element_size(cur));
+            chunk = ggml_cont(ctx0, chunk);
+            chunk = build_norm(chunk, model.eagle3_fc_norm[k], nullptr, LLM_NORM_RMS, -1);
+            parts.push_back(chunk);
+        }
+
+        cur = parts[0];
+        for (size_t k = 1; k < parts.size(); ++k) {
+            cur = ggml_concat(ctx0, cur, parts[k], /*dim*/ 0);
+        }
+        cb(cur, "fc_norm", -1);
+    }
 
     // Feature fusion layer
     cur = build_lora_mm(model.fc, cur);
@@ -281,14 +329,23 @@ llama_model_eagle3::graph<false>::graph(const llama_model & model, const llm_gra
 
     cur = inpL;
 
-    // Output prenorm state (for next token's g_embeddings in autoregressive generation)
-    ggml_set_output(cur);
-    res->t_h_pre_norm = cur;
+    // norm_output (SpecDrift): when true, the drafter feeds the POST-output_norm hidden state
+    // forward as the next step's g_embd (matches training-time aux feature distribution).
+    // Otherwise we keep the legacy pre-norm behaviour.
+    if (!hparams.eagle3_norm_output) {
+        ggml_set_output(cur);
+        res->t_h_pre_norm = cur;
+    }
 
     cur = build_norm(cur,
             model.output_norm, NULL,
             LLM_NORM_RMS, -1);
     cb(cur, "result_norm", -1);
+
+    if (hparams.eagle3_norm_output) {
+        ggml_set_output(cur);
+        res->t_h_pre_norm = cur;
+    }
 
     // lm_head - projects to draft vocabulary
     cur = build_lora_mm(model.output, cur);

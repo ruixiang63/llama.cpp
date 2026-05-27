@@ -1960,7 +1960,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             }
         }
 
-        extract_layer_inputs(res);
+        extract_layer_inputs(res, (uint32_t) n_tokens_prev, n_tokens_all);
 
         // extract pre-norm embeddings (hidden state before the final output norm)
         // only meaningful in LLAMA_POOLING_TYPE_NONE (per-token); other pooling modes are ignored.
@@ -2199,7 +2199,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     return n_outputs_max;
 }
 
-void llama_context::extract_layer_inputs(const llm_graph_result * res) {
+void llama_context::extract_layer_inputs(const llm_graph_result * res, uint32_t n_tokens_prev, uint32_t n_tokens_all) {
     for (uint32_t il = 0; il < cparams.output_layer_inp.size(); ++il) {
         if (!cparams.output_layer_inp[il]) {
             continue;
@@ -2208,11 +2208,18 @@ void llama_context::extract_layer_inputs(const llm_graph_result * res) {
         if (!t) {
             continue;
         }
-        const size_t nbytes = ggml_nbytes(t);
-        embd_layer_inp[il].resize(nbytes / sizeof(float));
+        // layer inputs are [n_embd, ubatch.n_tokens] for this ubatch; the consumer
+        // (e.g. EAGLE3) indexes by token position over the whole batch, so size the
+        // host buffer for all n_tokens_all rows and write this ubatch at its offset.
+        const int64_t n_embd = t->ne[0];
+        const size_t  nbytes = ggml_nbytes(t);
+        GGML_ASSERT((size_t) n_tokens_prev * n_embd * sizeof(float) + nbytes <=
+                    (size_t) n_tokens_all * n_embd * sizeof(float));
+        embd_layer_inp[il].resize((size_t) n_tokens_all * n_embd);
         ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), t);
         GGML_ASSERT(backend != nullptr);
-        ggml_backend_tensor_get_async(backend, t, embd_layer_inp[il].data(), 0, nbytes);
+        ggml_backend_tensor_get_async(backend, t, embd_layer_inp[il].data() + (size_t) n_tokens_prev * n_embd, 0,
+                                      nbytes);
     }
 }
 
@@ -4084,5 +4091,7 @@ void llama_set_output_layer_inp(struct llama_context * ctx, uint32_t layer_id, b
 }
 
 float * llama_get_output_layer_inp(struct llama_context * ctx, uint32_t layer_id) {
+    ctx->synchronize();
+
     return ctx->get_output_layer_inp(layer_id);
 }

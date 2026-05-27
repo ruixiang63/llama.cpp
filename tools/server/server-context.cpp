@@ -753,6 +753,7 @@ private:
 
         params_base = params;
 
+
         std::string & mmproj_path = params_base.mmproj.path;
         bool has_mmproj = !mmproj_path.empty();
         mtmd_context_params mparams = mtmd_context_params_default();
@@ -848,6 +849,17 @@ private:
                                             COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
             if (spec_mtp) {
                 cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+            }
+
+            const bool spec_eagle3 =
+                std::find(params_base.speculative.types.begin(), params_base.speculative.types.end(),
+                          COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3) != params_base.speculative.types.end();
+
+            if (spec_eagle3 && cparams.n_ubatch < cparams.n_batch) {
+                SRV_WRN(
+                    "eagle3: raising draft n_ubatch %u -> %u so llama_encode() can project a full batch in one pass\n",
+                    cparams.n_ubatch, cparams.n_batch);
+                cparams.n_ubatch = cparams.n_batch;
             }
 
             // note: for small models maybe we can set this to the maximum possible draft from all speculative types

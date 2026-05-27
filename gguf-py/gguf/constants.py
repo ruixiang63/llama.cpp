@@ -155,6 +155,8 @@ class Keys:
         EAGLE3_EXTRACT_LAYERS             = "{arch}.extract_layers"
         EAGLE3_TARGET_HIDDEN_SIZE         = "{arch}.target_hidden_size"
         EAGLE3_NORM_BEFORE_RESIDUAL       = "{arch}.norm_before_residual"
+        EAGLE3_FC_NORM                    = "{arch}.fc_norm"
+        EAGLE3_NORM_OUTPUT                = "{arch}.norm_output"
 
     class Attention:
         HEAD_COUNT                   = "{arch}.attention.head_count"
@@ -868,6 +870,7 @@ class MODEL_TENSOR(IntEnum):
     NEXTN_SHARED_HEAD_NORM = auto()
     # eagle3
     EAGLE3_FC          = auto()  # feature fusion layer
+    EAGLE3_FC_NORM     = auto()  # per-extract-layer norm applied before fc
     EAGLE3_HIDDEN_NORM = auto()  # hidden normalization
     EAGLE3_D2T         = auto()  # draft to target vocabulary mapping
     # lfm2 audio
@@ -1417,6 +1420,7 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.NEXTN_SHARED_HEAD_HEAD:    "blk.{bid}.nextn.shared_head_head",
     MODEL_TENSOR.NEXTN_SHARED_HEAD_NORM:    "blk.{bid}.nextn.shared_head_norm",
     MODEL_TENSOR.EAGLE3_FC:                 "fc",
+    MODEL_TENSOR.EAGLE3_FC_NORM:            "fc_norm.{bid}",
     MODEL_TENSOR.EAGLE3_HIDDEN_NORM:        "blk.{bid}.hidden_norm",
     MODEL_TENSOR.EAGLE3_D2T:                "d2t",
 }
@@ -3881,6 +3885,7 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.FFN_DOWN,
         MODEL_TENSOR.FFN_UP,
         MODEL_TENSOR.EAGLE3_FC,
+        MODEL_TENSOR.EAGLE3_FC_NORM,
         MODEL_TENSOR.EAGLE3_HIDDEN_NORM,
         MODEL_TENSOR.EAGLE3_D2T,
     ],

@@ -221,6 +221,10 @@ struct llama_hparams {
     uint32_t target_hidden_size     = 0;
     // eagle3: whether to apply hidden_norm before storing residual
     bool eagle3_norm_before_residual = false;
+    // eagle3: per-aux-layer RMSNorm before fc fusion
+    bool eagle3_fc_norm = false;
+    // eagle3: capture hidden states after each drafter's final RMSNorm
+    bool eagle3_norm_output = false;
 
     // gemma4 per-layer embedding
     uint32_t n_embd_per_layer = 0;
