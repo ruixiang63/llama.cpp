@@ -420,6 +420,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
     int32_t         tgt_hidden       = 0;       // target model hidden size
     const int32_t * extract_layers   = nullptr; // model_dft's extract layer indices
     uint32_t        n_extract_layers = 0;
+    int32_t         layer_offset     = 0;       // EAGLE3_LAYER_OFFSET tunable: shift captured target layer index
 
     // [per-seq] deferred boundary state
     std::vector<std::vector<float>> pending_g_last;
@@ -479,10 +480,16 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
             sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
             s.reset(common_sampler_init(llama_get_model(ctx_dft), sparams));
         }
+        if (const char * env = getenv("EAGLE3_LAYER_OFFSET")) {
+            layer_offset = atoi(env);
+            LOG_INF("%s: EAGLE3_LAYER_OFFSET = %d\n", __func__, layer_offset);
+        }
 
         // turn on extraction of the target layers' input embeddings
         for (uint32_t k = 0; k < n_extract_layers; ++k) {
-            llama_set_output_layer_inp(ctx_tgt, (uint32_t) extract_layers[k], true);
+            int32_t il = extract_layers[k] + layer_offset;
+            il         = std::max(0, std::min(il, (int32_t) llama_model_n_layer(model_tgt) - 1));
+            llama_set_output_layer_inp(ctx_tgt, (uint32_t) il, true);
         }
 
         // turn on extraction of the draft model's pre-norm hidden state
@@ -558,10 +565,11 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         features_buf.assign((size_t) n_tokens * n_embd_enc, 0.0f);
 
         for (uint32_t k = 0; k < n_extract_layers; ++k) {
-            const float * layer = llama_get_output_layer_inp(ctx_tgt, (uint32_t) extract_layers[k]);
+            int32_t il = extract_layers[k] + layer_offset;
+            il         = std::max(0, std::min(il, (int32_t) llama_model_n_layer(llama_get_model(ctx_tgt)) - 1));
+            const float * layer = llama_get_output_layer_inp(ctx_tgt, (uint32_t) il);
             if (!layer) {
-                GGML_ABORT("EAGLE3: target layer %d input not extracted.",
-                           extract_layers[k]);
+                GGML_ABORT("EAGLE3: target layer %d input not extracted.", il);
             }
             for (int32_t i = 0; i < n_tokens; ++i) {
                 float * dst = features_buf.data() + (size_t) i * n_embd_enc + k * (size_t) tgt_hidden;
