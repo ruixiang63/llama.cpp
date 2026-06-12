@@ -1326,9 +1326,12 @@ void llama_context::dflash_append_features(const float * feat, int32_t n_new, in
     const auto & hparams = model.hparams;
     const size_t n_feat  = hparams.dflash_target_layer_ids.size() * hparams.n_embd;
 
-    dflash.feat_staging.assign(feat, feat + n_feat * n_new);
+    // `feat` is the position-indexed target-feature buffer (see extract_dflash_features); the new
+    // tokens to encode are the [n_total - n_new, n_total) slice, not the first n_new entries.
+    const int32_t feat_pos0 = n_total - n_new;
+    dflash.feat_staging.assign(feat + (size_t) feat_pos0 * n_feat, feat + (size_t) n_total * n_feat);
     dflash.feat_n      = n_new;
-    dflash.feat_pos0   = n_total - n_new;
+    dflash.feat_pos0   = feat_pos0;
     dflash.feat_bucket = n_new <= 8 ? 8 : 256; // graph rebuilds when the bucket changes (prompt round)
 
     // bucketed mask/position sizing, same scheme as the legacy host-mediated path
@@ -1536,16 +1539,23 @@ bool llama_context::dflash_promote_state(int32_t idx, llama_pos pos_last, llama_
             }
         }
 
+        // views created in a no_alloc context don't carry a buffer; set it to the parent's so the
+        // backend copy can resolve buffer_is_host (the CPU backend asserts on a null buffer; the CUDA
+        // path happened to skip the check). Required for the trace/promote path to run on CPU.
         ggml_tensor * src_s = ggml_view_1d(cg.get(), dflash.trace_s[il], hparams.n_embd_s(),
                 (size_t) idx  * dflash.trace_s[il]->nb[1]);
         ggml_tensor * dst_s = ggml_view_1d(cg.get(), s_l, hparams.n_embd_s(),
                 (size_t) cell * s_l->nb[1]);
+        src_s->buffer = dflash.trace_s[il]->buffer;
+        dst_s->buffer = s_l->buffer;
         ggml_backend_tensor_copy_async(be, be, src_s, dst_s);
 
         ggml_tensor * src_r = ggml_view_1d(cg.get(), dflash.trace_r[il], hparams.n_embd_r(),
                 (size_t) idx  * dflash.trace_r[il]->nb[1]);
         ggml_tensor * dst_r = ggml_view_1d(cg.get(), r_l, hparams.n_embd_r(),
                 (size_t) cell * r_l->nb[1]);
+        src_r->buffer = dflash.trace_r[il]->buffer;
+        dst_r->buffer = r_l->buffer;
         ggml_backend_tensor_copy_async(be, be, src_r, dst_r);
     }
 
@@ -2997,7 +3007,19 @@ void llama_context::extract_dflash_features(const llama_ubatch & ubatch) {
     const size_t n_layers = dflash.extract_tensors.size();
 
     const int64_t n_embd_concat = n_embd * n_layers;
-    dflash.target_features.resize(n_embd_concat * n_tokens);
+    // Index the per-token features by their ABSOLUTE position, accumulating across ubatches. The
+    // draft (dflash_append_features) reads the [n_total - n_new, n_total) slice, so a prompt processed
+    // in multiple ubatches (the server chunks it) and a partial-accept verify block both land at the
+    // right positions. The old resize(n_tokens) overwrote the buffer with only the last ubatch, so a
+    // chunked prompt left the first draft reading garbage -> argmax -1 -> "invalid token -1" decode fail.
+    llama_pos pos_max = -1;
+    for (int64_t i = 0; i < n_tokens; ++i) {
+        pos_max = std::max(pos_max, ubatch.pos[i]);
+    }
+    const size_t need = (size_t)(pos_max + 1) * n_embd_concat;
+    if (dflash.target_features.size() < need) {
+        dflash.target_features.resize(need);
+    }
 
     static thread_local std::vector<float> temp_layer_features;
     temp_layer_features.resize(n_embd * n_tokens);
@@ -3020,8 +3042,9 @@ void llama_context::extract_dflash_features(const llama_ubatch & ubatch) {
         ggml_backend_sched_synchronize(sched.get());
 
         for (int64_t token_idx = 0; token_idx < n_tokens; ++token_idx) {
+            const llama_pos pos = ubatch.pos[token_idx];
             const float * src = temp_layer_features.data() + token_idx * n_embd;
-            float * dest = dflash.target_features.data() + token_idx * n_embd_concat + layer_idx * n_embd;
+            float * dest = dflash.target_features.data() + (size_t) pos * n_embd_concat + layer_idx * n_embd;
             std::memcpy(dest, src, n_embd * sizeof(float));
         }
     }

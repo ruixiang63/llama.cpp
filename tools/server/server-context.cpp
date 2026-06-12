@@ -96,6 +96,11 @@ struct server_slot {
     // the verify decode so a partial acceptance promotes the state at the accepted position on-device
     // instead of the ~50 MiB host checkpoint round-trip + re-decode (see llama_dflash_promote_state)
     bool spec_state_trace = false;
+    // DFlash GPU greedy verify: when the request samples a raw argmax (pure greedy, no penalties/
+    // grammar/logit-bias/n_probs), the target decode emits an on-device argmax of the verify block
+    // and the host skips the ~n_vocab x block logits download + CPU sampler. Lossless for greedy.
+    bool spec_gpu_verify = false;
+    bool spec_argmax_active = false; // out_argmax currently enabled on slot.ctx (after the first sample)
     llama_pos spec_pos0 = 0; // base position of the current verify batch (rewind target = pos0 + accepted)
 
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
@@ -1364,6 +1369,30 @@ private:
                 llama_set_sampler(ctx, slot.id, common_sampler_get(slot.smpl.get()));
             } else {
                 llama_set_sampler(ctx, slot.id, nullptr);
+            }
+
+            // DFlash GPU greedy verify: when this request samples a raw argmax (pure greedy: temp<=0,
+            // no penalties / DRY / grammar / logit-bias / n_probs), turn on the target's on-device
+            // argmax so the verify reads block_size+1 ints instead of downloading block_size+1 x n_vocab
+            // logits and running the host sampler. Lossless for greedy; falls back to the host path
+            // otherwise. Toggled per request (out_argmax change triggers a one-off graph reserve).
+            {
+                const auto & sp = task.params.sampling;
+                const bool pure_greedy =
+                    sp.temp <= 0.0f && sp.penalty_repeat == 1.0f && sp.penalty_freq == 0.0f &&
+                    sp.penalty_present == 0.0f && sp.dry_multiplier == 0.0f && sp.grammar.empty() &&
+                    sp.logit_bias.empty() && sp.n_probs == 0;
+                slot.spec_gpu_verify = params_base.speculative.dflash && params_base.n_parallel == 1 &&
+                    pure_greedy &&
+                    !(getenv("LLAMA_SPEC_NO_GPU_VERIFY") && std::string(getenv("LLAMA_SPEC_NO_GPU_VERIFY")) != "0");
+                // out_argmax is turned ON only after the first token is sampled from logits (like
+                // speculative-simple): the prompt's first sample needs raw logits, the verify loop
+                // afterwards reads the on-device argmax. Reset here for a fresh request on the slot.
+                llama_set_out_argmax(slot.ctx, false);
+                slot.spec_argmax_active = false;
+                if (slot.spec_gpu_verify) {
+                    SLT_INF(slot, "%s", "DFlash GPU greedy verify enabled (on-device argmax)\n");
+                }
             }
 
             SLT_INF(slot, "sampler chain: %s\n", common_sampler_print(slot.smpl.get()).c_str());
@@ -2956,7 +2985,22 @@ private:
 
                 const int tok_idx = slot.i_batch - i;
 
-                llama_token id = common_sampler_sample(slot.smpl.get(), slot.ctx, tok_idx);
+                llama_token id;
+                if (slot.spec_gpu_verify && slot.spec_argmax_active) {
+                    // out_argmax already on (a rare empty-draft round after the first token): read the
+                    // target's on-device argmax for this output row instead of the (unavailable) logits
+                    int32_t n_am = 0;
+                    const int32_t * am = llama_get_dflash_argmax(slot.ctx, &n_am);
+                    GGML_ASSERT(am != nullptr && tok_idx < n_am && "DFlash target argmax missing");
+                    id = (llama_token) am[tok_idx];
+                } else {
+                    id = common_sampler_sample(slot.smpl.get(), slot.ctx, tok_idx);
+                    // first sample done from logits -> enable on-device argmax for the verify loop
+                    if (slot.spec_gpu_verify && !slot.spec_argmax_active) {
+                        llama_set_out_argmax(slot.ctx, true);
+                        slot.spec_argmax_active = true;
+                    }
+                }
 
                 slot.i_batch = -1;
 
@@ -3018,7 +3062,37 @@ private:
                     }
 
                     GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
-                    auto accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx, slot.spec_i_batch, slot.spec_draft);
+                    llama_tokens accepted;
+                    if (slot.spec_gpu_verify) {
+                        // greedy accept from the target's on-device argmax (DFlash sets output_all, so
+                        // the argmax row == the verify token's batch index in spec_i_batch). Same
+                        // semantics as common_sampler_sample_and_accept_n with a greedy sampler: take
+                        // the target token at each position up to and including the first mismatch, plus
+                        // a bonus token if every draft matched. Skips the per-block logits download.
+                        int32_t n_am = 0;
+                        const int32_t * am = llama_get_dflash_argmax(slot.ctx, &n_am);
+                        GGML_ASSERT(am != nullptr && "DFlash target argmax missing");
+                        size_t k = 0;
+                        for (; k < slot.spec_draft.size(); ++k) {
+                            const int32_t row = slot.spec_i_batch[k];
+                            GGML_ASSERT(row < n_am);
+                            const llama_token t = (llama_token) am[row];
+                            accepted.push_back(t);
+                            common_sampler_accept(slot.smpl.get(), t, true);
+                            if (slot.spec_draft[k] != t) {
+                                break;
+                            }
+                        }
+                        if (k == slot.spec_draft.size()) { // all drafts matched -> bonus token
+                            const int32_t row = slot.spec_i_batch[k];
+                            GGML_ASSERT(row < n_am);
+                            const llama_token t = (llama_token) am[row];
+                            accepted.push_back(t);
+                            common_sampler_accept(slot.smpl.get(), t, true);
+                        }
+                    } else {
+                        accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx, slot.spec_i_batch, slot.spec_draft);
+                    }
                     slot.spec_i_batch.clear();
 
                     SLT_DBG(slot, "%s: n_draft=%zu, accepted=%zu\n", __func__, slot.spec_draft.size(), accepted.size());

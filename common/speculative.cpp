@@ -763,6 +763,12 @@ struct common_speculative_state_dflash : public common_speculative_state {
 
     void begin(const llama_tokens & prompt) override {
         GGML_UNUSED(prompt);
+        // New sequence (server: new request on the slot): the target features are re-extracted from
+        // position 0 and the DFlash device cross cache is rewritten from there, so reset the running
+        // count. Without this, dflash_n_past carries over from the previous request and the first
+        // draft computes n_new = n - dflash_n_past < 1 -> GGML_ASSERT(n_new >= 1) abort.
+        dflash_n_past = 0;
+        accumulated_ctx.clear();
     }
 
     void draft(
