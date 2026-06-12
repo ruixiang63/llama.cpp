@@ -397,7 +397,14 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
     GGML_ASSERT(b->ne[0] == 1   && b->ne[1] == H_v && b->ne[2] == n_tokens && b->ne[3] == n_seqs);
     GGML_ASSERT(s->ne[0] == S_v && s->ne[1] == S_v && s->ne[2] == H_v      && s->ne[3] == n_seqs);
 
-    ggml_tensor * result = ggml_gated_delta_net(ctx0, q, k, v, g, b, s);
+    ggml_tensor * result;
+    if (gdn_trace != nullptr) {
+        // per-token state trace requested (DFlash speculative rewind on recurrent targets)
+        result = ggml_gated_delta_net_trace(ctx0, q, k, v, g, b, s, gdn_trace);
+        gdn_trace = nullptr; // consumed
+    } else {
+        result = ggml_gated_delta_net(ctx0, q, k, v, g, b, s);
+    }
     if (n_tokens == 1) {
         cb(result, LLAMA_TENSOR_NAME_FGDN_AR, il);
     } else {
@@ -434,6 +441,7 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
         if (cparams.fused_gdn_ar) {
             return build_delta_net_fused(q, k, v, g, b, s, il);
         }
+        GGML_ASSERT(gdn_trace == nullptr && "GDN state trace requires the fused kernel path");
         return build_delta_net_autoregressive(q, k, v, g, b, s, il);
     }
 
@@ -441,5 +449,6 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
         return build_delta_net_fused(q, k, v, g, b, s, il);
     }
 
+    GGML_ASSERT(gdn_trace == nullptr && "GDN state trace requires the fused kernel path");
     return build_delta_net_chunking(q, k, v, g, b, s, il);
 }

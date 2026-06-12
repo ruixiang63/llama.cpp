@@ -9,6 +9,7 @@ gated_delta_net_cuda(const float * q,
                                      const float * beta,
                                      const float * curr_state,
                                      float *       dst,
+                                     float *       trace, // optional per-token state trace (n_seqs==1), may be nullptr
                                      int64_t       H,
                                      int64_t       n_tokens,
                                      int64_t       n_seqs,
@@ -134,6 +135,17 @@ gated_delta_net_cuda(const float * q,
             }
         }
 
+        // per-token state trace for speculative-decoding rewind (same transposed layout as the
+        // final state writeback below). near-free: the state already lives in registers here.
+        if (trace != nullptr) {
+            float * tr = trace + ((int64_t) t * H + h_idx) * S_v * S_v;
+#pragma unroll
+            for (int r = 0; r < rows_per_lane; r++) {
+                const int i      = r * warp_size + lane;
+                tr[col * S_v + i] = s_shard[r];
+            }
+        }
+
         attn_data += S_v * H;
     }
 
@@ -149,7 +161,7 @@ template <bool KDA>
 static void launch_gated_delta_net(
         const float * q_d, const float * k_d, const float * v_d,
         const float * g_d, const float * b_d, const float * s_d,
-        float * dst_d,
+        float * dst_d, float * trace_d,
         int64_t S_v,   int64_t H, int64_t n_tokens, int64_t n_seqs,
         int64_t sq1,   int64_t sq2, int64_t sq3,
         int64_t sv1,   int64_t sv2, int64_t sv3,
@@ -170,26 +182,26 @@ static void launch_gated_delta_net(
     switch (S_v) {
         case 16:
             gated_delta_net_cuda<16, KDA><<<grid_dims, block_dims, 0, stream>>>(
-                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, H,
+                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, trace_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
             break;
         case 32:
             gated_delta_net_cuda<32, KDA><<<grid_dims, block_dims, 0, stream>>>(
-                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, H,
+                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, trace_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
             break;
         case 64: {
             gated_delta_net_cuda<64, KDA><<<grid_dims, block_dims, 0, stream>>>(
-                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, H,
+                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, trace_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
             break;
         }
         case 128: {
             gated_delta_net_cuda<128, KDA><<<grid_dims, block_dims, 0, stream>>>(
-                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, H,
+                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, trace_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
             break;
@@ -237,6 +249,11 @@ void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor *
     const float * s_d   = (const float *) src_state->data;
     float *       dst_d = (float *) dst->data;
 
+    // optional per-token state trace (speculative-decoding rewind); src[6] is a persistent tensor
+    ggml_tensor * src_trace = dst->src[6];
+    float *       trace_d   = src_trace ? (float *) src_trace->data : nullptr;
+    GGML_ASSERT(src_trace == nullptr || n_seqs == 1);
+
     GGML_ASSERT(ggml_is_contiguous_rows(src_q));
     GGML_ASSERT(ggml_is_contiguous_rows(src_k));
     GGML_ASSERT(ggml_is_contiguous_rows(src_v));
@@ -262,11 +279,11 @@ void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor *
     cudaStream_t stream = ctx.stream();
 
     if (kda) {
-        launch_gated_delta_net<true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d,
+        launch_gated_delta_net<true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, trace_d,
             S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
             sb1, sb2, sb3, neqk1, rq3, scale, stream);
     } else {
-        launch_gated_delta_net<false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d,
+        launch_gated_delta_net<false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, trace_d,
             S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
             sb1, sb2, sb3, neqk1, rq3, scale, stream);
     }

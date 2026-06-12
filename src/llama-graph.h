@@ -66,6 +66,15 @@ struct llama_cross {
     int64_t n_embd = 0;
     int64_t n_enc  = 0;
 
+    // DFlash: number of *valid* target-context rows inside the fixed-capacity (n_enc) buffer.
+    // Rows [n_enc_valid, n_enc) are zero padding and are masked out in the DFlash decoder, so the
+    // cross tensor keeps a constant shape across speculative rounds (enables graph reuse).
+    int64_t n_enc_valid = 0;
+
+    // DFlash: the context is append-only across speculative rounds; rows [0, n_enc_appended) of
+    // v_embd are unchanged since the previous round, so set_input only uploads the delta
+    int64_t n_enc_appended = 0;
+
     // embeddings data copied to host memory (tmp)
     std::vector<float> v_embd;
 
@@ -104,6 +113,29 @@ struct llama_dflash {
     std::vector<float> target_features;
 
     std::vector<ggml_tensor *> extract_tensors;
+
+    // recurrent state trace (staging): per-token SSM/conv states captured during the verify decode
+    // of a hybrid target, so that on a partial draft acceptance the state at the accepted position
+    // is promoted instead of restore+re-decode. tensors live in a persistent context-owned buffer.
+    int32_t trace_n_max = 0;                // max tokens traced per decode (0 = disabled)
+    std::vector<ggml_tensor *> trace_s;     // per-layer [n_embd_s, trace_n_max] (recurrent layers only)
+    std::vector<ggml_tensor *> trace_r;     // per-layer [n_embd_r, trace_n_max] (conv windows)
+
+    // device-resident encoded-context cache for the DFlash decoder (encoder folded into the
+    // decoder graph): new target features are fc+norm'ed in-graph and appended into cross_dev
+    // via ggml_set_rows, eliminating the separate encoder llama_encode round trip per draft.
+    ggml_tensor * cross_dev = nullptr;      // [n_embd, cross_cap + 1] (last row = scratch for padding)
+    int32_t cross_cap = 0;                  // capacity in rows (0 = host-mediated legacy path)
+    std::vector<float> feat_staging;        // host staging of the NEW tokens' raw target features
+    int32_t feat_n      = 0;                // number of staged feature rows
+    int32_t feat_pos0   = 0;                // destination row of the first staged feature
+    int32_t feat_bucket = 8;                // padded feature rows in the graph (8 normally; 256 for the prompt round)
+
+    // async draft feed: the drafter's argmax tokens are handed device-to-device into the verify
+    // batch, so there is no host synchronization between the draft and the verify submission
+    ggml_tensor * last_argmax_t = nullptr;  // this context's argmax tensor from the last decode
+    ggml_tensor * draft_feed    = nullptr;  // (target ctx) device staging for fed draft tokens [I32]
+    int32_t draft_feed_n = 0;               // pending fed rows to patch into inp_tokens rows [1..n]
 
     void clear() {
         target_features.clear();
@@ -291,6 +323,12 @@ public:
     virtual ~llm_graph_input_cross_embd() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override;
+
+    // rows of cross->v_embd already uploaded to this input's device tensor (-1 = never uploaded;
+    // a graph rebuild creates a fresh input object, so the full upload happens automatically)
+    int64_t n_uploaded = -1;
 
     ggml_tensor * cross_embd; // F32 [n_embd, n_outputs_enc]
 
@@ -684,6 +722,10 @@ public:
     ggml_tensor * get_logits()      const { return t_logits; }
     ggml_tensor * get_embd()        const { return t_embd; }
     ggml_tensor * get_embd_pooled() const { return t_embd_pooled; }
+    ggml_tensor * get_argmax()      const { return t_argmax; }
+    ggml_tensor * get_spec_pdraft()   const { return t_spec_pdraft; }
+    ggml_tensor * get_spec_topk_idx() const { return t_spec_topk_idx; }
+    ggml_tensor * get_spec_topk_val() const { return t_spec_topk_val; }
 
     ggml_cgraph  * get_gf()  const { return gf; }
     ggml_context * get_ctx() const { return ctx_compute.get(); }
@@ -712,6 +754,10 @@ public:
     ggml_tensor * t_logits      = nullptr;
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
+    ggml_tensor * t_argmax      = nullptr; // I32 [n_tokens] greedy tokens (DFlash drafter)
+    ggml_tensor * t_spec_pdraft   = nullptr; // F32 [n_tokens] temp-softmax prob of each draft token
+    ggml_tensor * t_spec_topk_idx = nullptr; // I32 [K, n_tokens] top-K token ids per row (top-k/top-p verify)
+    ggml_tensor * t_spec_topk_val = nullptr; // F32 [K, n_tokens] their raw logits
 
     std::map<llama_seq_id, ggml_tensor*> t_sampled_logits;
     std::map<llama_seq_id, ggml_tensor*> t_candidates;

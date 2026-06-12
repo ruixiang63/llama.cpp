@@ -780,32 +780,12 @@ struct common_speculative_state_dflash : public common_speculative_state {
         GGML_ASSERT(n >= 1 && "prompt_tgt is empty");
         GGML_ASSERT(n_new >= 1 && "must have at least 1 new token");
 
-        // Step 1: Encode new accepted tokens' features
+        // Steps 1+2 folded into the decoder graph: stage the NEW tokens' raw target features;
+        // the decoder encodes them (fc+norm) in-graph and appends into the device-resident
+        // context cache. No separate encoder pass, no host round trip of encoded features.
+        GGML_UNUSED(n_embd);
         const float * features = llama_get_dflash_target_features(ctx_tgt);
-
-        llama_batch enc_batch = {
-            /*.n_tokens  =*/ n_new,
-            /*.token     =*/ nullptr,
-            /*.embd      =*/ const_cast<float*>(features),
-            /*.pos       =*/ nullptr,
-            /*.n_seq_id  =*/ nullptr,
-            /*.seq_id    =*/ nullptr,
-            /*.logits    =*/ nullptr,
-        };
-        if (llama_encode(ctx_dft_enc, enc_batch) != 0) {
-            LOG_ERR("DFlash: encoder failed\n");
-            return;
-        }
-
-        const float * target_ctx_new = llama_get_embeddings(ctx_dft_enc);
-        GGML_ASSERT(target_ctx_new && "encoder output is null");
-
-        // Step 2: Append to accumulated target_ctx and set on decoder context (writes to cross.v_embd)
-        const size_t new_size = (size_t)n_embd * n_new;
-        accumulated_ctx.insert(accumulated_ctx.end(), target_ctx_new, target_ctx_new + new_size);
-
-        const int n_ctx_total = (int)(accumulated_ctx.size() / n_embd);
-        llama_set_dflash_accumulated_target_ctx(ctx_dft_dec, accumulated_ctx.data(), n_embd, n_ctx_total);
+        llama_dflash_append_features(ctx_dft_dec, features, n_new, n);
 
         // Step 3: Decode noise block
         const llama_token mask_token_id = llama_model_dflash_mask_token_id(llama_get_model(ctx_dft_dec));
@@ -813,7 +793,9 @@ struct common_speculative_state_dflash : public common_speculative_state {
         common_batch_clear(batch);
         for (int i = 0; i < block_size; i++) {
             const llama_token tok = (i == 0) ? id_last : mask_token_id;
-            common_batch_add(batch, tok, i, {0}, true);
+            // logits=false: the greedy draft tokens come from the on-device argmax below, so the
+            // n_vocab x block logits host copy (~5 MB/round at vocab 248k) is skipped entirely
+            common_batch_add(batch, tok, i, {0}, false);
         }
 
         if (llama_decode(ctx_dft_dec, batch) != 0) {
@@ -823,18 +805,26 @@ struct common_speculative_state_dflash : public common_speculative_state {
 
         dflash_n_past = n;
 
-        // Step 4: Sample draft tokens from positions 1..block_size-1
+        // Step 4: greedy top-1 draft tokens from the decoder's on-device argmax (the DFlash decode
+        // graph appends a GGML argmax node over the block logits). The drafted tokens are verified
+        // by the target regardless, so this cannot affect correctness, only draft latency.
         result.clear();
-        common_sampler_reset(smpl);
 
+        // async feed (LLAMA_SPEC_ASYNC=1): hand the draft tokens to the target device-to-device
+        // and return placeholders - the host reads the actual values only after the verify decode
+        // (one synchronization per round instead of two; the GPU queues draft+verify back-to-back)
+        static const bool async_feed = getenv("LLAMA_SPEC_ASYNC") != nullptr &&
+                                       std::string(getenv("LLAMA_SPEC_ASYNC")) != "0";
+        if (async_feed && llama_dflash_feed_draft_tokens(ctx_tgt, ctx_dft_dec, block_size - 1)) {
+            result.assign(block_size - 1, 0); // placeholders; refilled by the caller post-verify
+            return;
+        }
+
+        int32_t n_am = 0;
+        const int32_t * am = llama_get_dflash_argmax(ctx_dft_dec, &n_am);
+        GGML_ASSERT(am != nullptr && n_am >= block_size && "DFlash decoder did not produce argmax");
         for (int i = 1; i < block_size; i++) {
-            common_sampler_sample(smpl, ctx_dft_dec, i);
-
-            const auto * cur_p = common_sampler_get_candidates(smpl, true);
-            const llama_token id = cur_p->data[0].id;
-
-            common_sampler_accept(smpl, id, true);
-            result.push_back(id);
+            result.push_back((llama_token) am[i]);
         }
     }
 
@@ -1124,6 +1114,18 @@ struct common_speculative {
 
     common_speculative_state * curr_impl = nullptr; // current implementation in use (for stats)
 };
+
+llama_context * common_speculative_get_dflash_decoder(common_speculative * spec) {
+    if (spec == nullptr) {
+        return nullptr;
+    }
+    for (auto & impl : spec->impls) {
+        if (impl->type == COMMON_SPECULATIVE_TYPE_DFLASH) {
+            return static_cast<common_speculative_state_dflash *>(impl.get())->ctx_dft_dec;
+        }
+    }
+    return nullptr;
+}
 
 static common_ngram_map get_common_ngram_map(const common_speculative_config & config) {
     uint16_t size_key   = config.params.ngram_size_n;

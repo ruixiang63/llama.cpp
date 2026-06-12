@@ -64,6 +64,10 @@ struct llm_build_delta_net_base : public llm_graph_context {
                 ggml_tensor * b,
                 ggml_tensor * s,
                         int   il);
+
+    // optional per-token state trace target for the NEXT build_delta_net call (fused path only);
+    // set by the caller (e.g. qwen35 during a DFlash verify), consumed+reset by build_delta_net_fused
+    ggml_tensor * gdn_trace = nullptr;
 };
 
 struct llm_build_rwkv6_base : public llm_graph_context {

@@ -92,6 +92,12 @@ struct server_slot {
     server_prompt_checkpoint spec_ckpt;
     common_speculative_ptr spec;
 
+    // DFlash recurrent rewind: when set, the target's per-token recurrent states are traced during
+    // the verify decode so a partial acceptance promotes the state at the accepted position on-device
+    // instead of the ~50 MiB host checkpoint round-trip + re-decode (see llama_dflash_promote_state)
+    bool spec_state_trace = false;
+    llama_pos spec_pos0 = 0; // base position of the current verify batch (rewind target = pos0 + accepted)
+
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
     std::unique_ptr<const server_task> task;
@@ -363,7 +369,9 @@ struct server_slot {
                     spec_draft.clear();
                 }
 
-                if (!spec_draft.empty() && ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
+                // the host checkpoint is only needed for the restore-based rewind; with the
+                // on-device state trace a partial acceptance promotes the state instead (no host copy)
+                if (!spec_draft.empty() && ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL && !spec_state_trace) {
                     const auto n_tokens = prompt.tokens.size();
 
                     spec_ckpt = server_get_checkpoint(ctx, this->id, n_tokens);
@@ -396,6 +404,7 @@ struct server_slot {
             }
 
             auto pos0 = prompt.tokens.pos_next();
+            spec_pos0 = pos0; // base position of the verify batch (for the DFlash on-device rewind)
 
             common_batch_add(batch, sampled, pos0++, { this->id }, true);
             for (auto token : spec_draft) {
@@ -929,6 +938,20 @@ private:
 
                 if (slot.spec) {
                     SLT_INF(slot, "%s", "speculative decoding context initialized\n");
+
+                    // DFlash on a hybrid/recurrent target: enable the recurrent state trace so a
+                    // partial acceptance promotes the accepted-position state on-device instead of
+                    // the host checkpoint round-trip. Only for the FULL-seq-rm regime (hybrid), and
+                    // only at n_parallel == 1 (the per-context feature extraction limitation above).
+                    const bool trace_ok = params_base.speculative.dflash &&
+                                          ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL &&
+                                          params_base.n_parallel == 1;
+                    if (trace_ok &&
+                        !(getenv("LLAMA_SPEC_NO_TRACE") && std::string(getenv("LLAMA_SPEC_NO_TRACE")) != "0")) {
+                        llama_set_dflash_state_trace(slot.ctx, params_base.speculative.n_max + 1);
+                        slot.spec_state_trace = true;
+                        SLT_INF(slot, "%s", "DFlash recurrent state trace enabled (on-device rewind)\n");
+                    }
                 }
             }
 
@@ -2987,9 +3010,10 @@ private:
                 {
                     const bool use_ckpt = slot.ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
-                    // only save the sampler sampler state if we use checkpoints
+                    // only save the sampler state if we use the checkpoint-restore rewind; the
+                    // on-device trace rewind commits forward and never rolls the sampler back
                     common_sampler_ptr smpl_save;
-                    if (use_ckpt) {
+                    if (use_ckpt && !slot.spec_state_trace) {
                         smpl_save.reset(common_sampler_clone(slot.smpl.get()));
                     }
 
@@ -3003,7 +3027,22 @@ private:
 
                     // check for partial draft acceptance
                     if (accepted.size() < slot.spec_draft.size() + 1) {
-                        if (use_ckpt) {
+                        if (slot.spec_state_trace) {
+                            // DFlash recurrent rewind: promote the traced state at the accepted
+                            // position instead of restoring a host checkpoint. The verify batch was
+                            // [sampled @ pos0, draft0 @ pos0+1, ...]; accepting `acc` drafts means the
+                            // state after batch token `acc` (trace slot `acc`, ending at pos0 + acc)
+                            // is correct. Then fall through to the normal commit path below - its
+                            // llama_memory_seq_rm(pos) truncates the rejected attention KV tail and
+                            // now succeeds because the recurrent cell pos was rewound.
+                            const int32_t   acc      = (int32_t) accepted.size() - 1;
+                            const llama_pos pos_last = slot.spec_pos0 + acc;
+
+                            if (!llama_dflash_promote_state(slot.ctx, acc, pos_last, slot.id)) {
+                                GGML_ABORT("%s: DFlash state promote failed (idx=%d)\n", __func__, acc);
+                            }
+                            // no checkpoint restore, no `continue` - fall through to commit
+                        } else if (use_ckpt) {
                             // partial acceptance is not supported by the context -> truncate the draft and restore the state
                             slot.spec_draft = std::move(accepted);
 

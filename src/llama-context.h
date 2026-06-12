@@ -110,6 +110,37 @@ struct llama_context {
     void set_eagle3(const llama_model * model);
     void set_dflash(const llama_model * model);
 
+    // DFlash recurrent rewind (staging): allocate per-token state trace buffers (n_max tokens) and
+    // enable tracing during multi-token decodes on recurrent layers
+    void set_dflash_state_trace(int32_t n_max);
+    // promote the traced state at token index `idx` of the last verify decode into the live
+    // recurrent cell of seq 0 and mark it as ending at position `pos_last`
+    bool dflash_promote_state(int32_t idx, llama_pos pos_last, llama_seq_id seq_id = 0);
+    // debug: bitwise-compare the last traced slot against the live recurrent cell
+    bool dflash_trace_check(int32_t n_batch_tokens);
+
+    // greedy argmax of the DFlash drafter's last decoded block (nullptr if not produced)
+    const int32_t * get_dflash_argmax(int32_t * n_out);
+
+    // emit on-device argmax of the output logits and skip the host logits copy (greedy verify)
+    void set_out_argmax(bool value);
+
+    // emit on-device sampling-verify data: temp baked in; topk>0 emits top-K candidates instead
+    void set_out_spec_sample(bool value, float temp, int32_t topk);
+    // per-draft-token temp-softmax probabilities from the last decode (nullptr if not produced)
+    const float * get_dflash_pdraft(int32_t * n_out);
+    // per-row top-K candidate token ids (+ logits via vals) from the last decode (row-major)
+    const int32_t * get_dflash_topk(int32_t * n_rows, int32_t * k, const float ** vals);
+    // fetch a single row of the device-resident verify logits (for residual/bonus sampling)
+    bool dflash_fetch_logits_row(int32_t row, float * out, int32_t n_vocab);
+
+    // DFlash decoder: stage the NEW tokens' raw target features for the in-graph encoder fold
+    // (fc+norm + set_rows append into the device cross cache). n_total = committed context rows.
+    void dflash_append_features(const float * feat, int32_t n_new, int32_t n_total);
+
+    // async draft feed: hand the drafter's argmax tokens to this (target) context on-device
+    bool dflash_feed_draft_tokens(llama_context * dft, int32_t n);
+
     // process a single ubatch with a specific graph type
     // if memory_context is provided, it will be applied first to the context's memory
     // ret contains the status of the graph computation
@@ -279,6 +310,32 @@ private:
                                  // mutable because it's modified during graph building (const function)
 
     mutable llama_dflash dflash;
+
+    // ownership of the DFlash state-trace tensors (see llama_dflash::trace_s/trace_r)
+    ggml_context_ptr        dflash_trace_ctx;
+    ggml_backend_buffer_ptr dflash_trace_buf;
+
+    // ownership of the DFlash device cross cache (see llama_dflash::cross_dev)
+    ggml_context_ptr        dflash_cross_ctx;
+    ggml_backend_buffer_ptr dflash_cross_buf;
+
+    // ownership of the async draft-feed staging + the inter-stream event (see llama_dflash::draft_feed)
+    ggml_context_ptr        dflash_feed_ctx;
+    ggml_backend_buffer_ptr dflash_feed_buf;
+    ggml_backend_event_t    dflash_feed_event = nullptr;
+
+    // on-device greedy argmax of the DFlash drafter's block logits (see t_argmax)
+    std::vector<int32_t> dflash_argmax_out;
+
+    // sampling speculative verify: per-draft-token temp-softmax probs (see t_spec_pdraft) and the
+    // device-resident logits tensor kept for fetching a single residual/bonus row on demand
+    std::vector<float> dflash_pdraft_out;
+    ggml_tensor *      dflash_logits_dev = nullptr;
+
+    // top-k/top-p verify: per-row top-K candidate ids + logits (row-major [n_out][K]) from last decode
+    std::vector<int32_t> dflash_topk_idx_out;
+    std::vector<float>   dflash_topk_val_out;
+    int32_t              dflash_topk_k = 0;
 
     // temp fix: avoid DFlash encoder/decoder mis-detection. They share one model_dft,
     // so shared model fields cannot safely identify the decoder (caused OOM).

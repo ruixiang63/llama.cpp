@@ -6213,6 +6213,33 @@ struct ggml_tensor * ggml_gated_delta_net(
     return result;
 }
 
+struct ggml_tensor * ggml_gated_delta_net_trace(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * g,
+        struct ggml_tensor  * beta,
+        struct ggml_tensor  * state,
+        struct ggml_tensor  * trace) {
+    const int64_t S_v      = v->ne[0];
+    const int64_t H        = v->ne[1];
+    const int64_t n_tokens = v->ne[2];
+    const int64_t n_seqs   = v->ne[3];
+
+    GGML_ASSERT(n_seqs == 1 && "gated_delta_net trace requires n_seqs == 1");
+    GGML_ASSERT(trace->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(trace));
+    GGML_ASSERT(ggml_nelements(trace) >= S_v * S_v * H * n_tokens);
+
+    struct ggml_tensor * result = ggml_gated_delta_net(ctx, q, k, v, g, beta, state);
+
+    // per-token state trace written by the kernel directly into this (persistent) tensor
+    result->src[6] = trace;
+
+    return result;
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 
 struct ggml_hash_set ggml_hash_set_new(size_t size) {

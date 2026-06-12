@@ -339,8 +339,43 @@ void llm_graph_input_cross_embd::set_input(const llama_ubatch * ubatch) {
     if (cross_embd && !cross->v_embd.empty()) {
         assert(cross_embd->type == GGML_TYPE_F32);
 
-        ggml_backend_tensor_set(cross_embd, cross->v_embd.data(), 0, ggml_nbytes(cross_embd));
+        // append-only fast path (DFlash speculative rounds): rows [0, n_enc_appended) are
+        // unchanged since the last upload, so only the delta is transferred. a graph rebuild
+        // creates a fresh input (n_uploaded = -1) and triggers the full upload, which also
+        // initializes the zero padding of the fixed-capacity buffer.
+        const int64_t row_bytes = cross->n_embd * ggml_element_size(cross_embd);
+        if (n_uploaded >= 0 && cross->n_enc_appended >= n_uploaded &&
+            cross->n_enc == cross_embd->ne[1]) {
+            const int64_t first = n_uploaded;
+            const int64_t last  = cross->n_enc_valid;
+            if (last > first) {
+                ggml_backend_tensor_set(cross_embd,
+                        cross->v_embd.data() + (size_t) first * cross->n_embd,
+                        (size_t) first * row_bytes,
+                        (size_t) (last - first) * row_bytes);
+            }
+        } else {
+            ggml_backend_tensor_set(cross_embd, cross->v_embd.data(), 0, ggml_nbytes(cross_embd));
+        }
+        n_uploaded = cross->n_enc_valid;
     }
+}
+
+bool llm_graph_input_cross_embd::can_reuse(const llm_graph_params & params) {
+    GGML_UNUSED(params);
+
+    // The cross embeddings are re-uploaded every step in set_input(), so the graph can be reused as
+    // long as the cross tensor shape is unchanged. This is what makes DFlash block drafting cheap:
+    // the target-context buffer is bucketed to a fixed capacity, so within a bucket the decoder
+    // graph is identical across speculative rounds (previously this input always forced a rebuild).
+    if (!cross_embd || !cross) {
+        return false;
+    }
+
+    const int64_t n_embd = !cross->v_embd.empty() ? cross->n_embd : cross_embd->ne[0];
+    const int64_t n_enc  = !cross->v_embd.empty() ? cross->n_enc  : cross_embd->ne[1];
+
+    return cross_embd->ne[0] == n_embd && cross_embd->ne[1] == n_enc;
 }
 
 static void print_mask(const float * data, int64_t n_tokens, int64_t n_kv, int64_t n_swa, llama_swa_type swa_type) {
@@ -805,6 +840,10 @@ void llm_graph_result::reset() {
     t_logits      = nullptr;
     t_embd        = nullptr;
     t_embd_pooled = nullptr;
+    t_argmax        = nullptr;
+    t_spec_pdraft   = nullptr;
+    t_spec_topk_idx = nullptr;
+    t_spec_topk_val = nullptr;
     t_sampled.clear();
     t_sampled_probs.clear();
     t_sampled_logits.clear();
@@ -2811,6 +2850,67 @@ void llm_graph_context::build_pooling(
 }
 
 void llm_graph_context::build_sampling() const {
+    // on-device greedy argmax over ALL output logit rows (speculative greedy-verify path):
+    // the verifier only needs the per-position argmax to accept/reject draft tokens, so
+    // downloading n_outputs ints instead of n_outputs x n_vocab floats skips a multi-MB host
+    // copy per verify round. some graphs (e.g. the DFlash drafter) set t_argmax themselves.
+    if (cparams.out_argmax && res->t_logits != nullptr && res->t_argmax == nullptr) {
+        ggml_tensor * am = ggml_argmax(ctx0, res->t_logits);
+        cb(am, "result_argmax", -1);
+        res->t_argmax = am;
+        ggml_build_forward_expand(gf, am);
+    }
+
+    // on-device temp-softmax probability of each draft token (sampling speculative verify):
+    // p_i(d_i) for every output row, gathered via a flat index (i*n_vocab + d_i) the context
+    // fills from the verify batch tokens. The host then does the cheap rejection test on these
+    // n_outputs floats and only fetches a single logits row for the residual/bonus sample,
+    // instead of downloading the whole n_vocab x block logits matrix.
+    if (cparams.out_spec_sample && res->t_logits != nullptr &&
+        res->t_spec_pdraft == nullptr && res->t_spec_topk_idx == nullptr) {
+        const int64_t n_vocab = res->t_logits->ne[0];
+        const int64_t n_out   = res->t_logits->ne[1];
+
+        if (cparams.spec_topk > 0) {
+            // top-k/top-p verify: emit the top-K candidate token ids + their raw logits per row.
+            // The host then applies the full sampler (temp/top-k/top-p) over those K candidates -
+            // the top-p nucleus is a subset of the top-K, so this is exact for realistic params.
+            const int64_t K = std::min<int64_t>(cparams.spec_topk, n_vocab);
+
+            // argsort-based top-K (ggml_top_k's CUDA path returned bad indices for ~248k vocab).
+            // argsort_top_k here returns FLAT indices (row*n_vocab + token) into the [n_vocab,n_out]
+            // logits, so they directly index the flattened [1, n_vocab*n_out] view - no base needed.
+            // The host recovers the token id as idx % n_vocab.
+            ggml_tensor * idx = ggml_cont(ctx0, ggml_argsort_top_k(ctx0, res->t_logits, K)); // I32 [K, n_out], flat
+
+            ggml_tensor * lflat = ggml_reshape_2d(ctx0, res->t_logits, 1, n_vocab * n_out);
+            ggml_tensor * vals  = ggml_get_rows(ctx0, lflat, ggml_reshape_1d(ctx0, idx, K * n_out));
+            vals = ggml_reshape_2d(ctx0, vals, K, n_out);                // F32 [K, n_out]
+
+            cb(idx,  "result_spec_topk_idx", -1);
+            cb(vals, "result_spec_topk_val", -1);
+            res->t_spec_topk_idx = idx;
+            res->t_spec_topk_val = vals;
+            ggml_build_forward_expand(gf, idx);
+            ggml_build_forward_expand(gf, vals);
+        } else {
+            // temperature-only verify: emit p_i(d_i) directly via a flat gather (exact, no top-K)
+            ggml_tensor * scaled = ggml_scale(ctx0, res->t_logits, 1.0f / cparams.spec_temp);
+            ggml_tensor * probs  = ggml_soft_max(ctx0, scaled); // [n_vocab, n_out]
+
+            ggml_tensor * gidx = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_out);
+            ggml_set_input(gidx);
+            ggml_set_name(gidx, "spec_gather_idx");
+
+            ggml_tensor * pflat   = ggml_reshape_2d(ctx0, probs, 1, n_vocab * n_out);
+            ggml_tensor * pgather = ggml_get_rows(ctx0, pflat, gidx);          // [1, n_out]
+            ggml_tensor * pdraft  = ggml_reshape_1d(ctx0, pgather, n_out);
+            cb(pdraft, "result_spec_pdraft", -1);
+            res->t_spec_pdraft = pdraft;
+            ggml_build_forward_expand(gf, pdraft);
+        }
+    }
+
     if (samplers.empty() || !res->t_logits) {
         return;
     }

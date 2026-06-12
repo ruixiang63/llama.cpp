@@ -4203,7 +4203,12 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
     if (graph->graph == nullptr) {
-        if (ggml_cuda_info().devices[cuda_ctx->device].cc < GGML_CUDA_CC_AMPERE) {
+        // CUDA graphs are gated to Ampere+ as a performance heuristic from the original PR, but
+        // Volta supports graph capture fine. GGML_CUDA_GRAPHS_VOLTA opts in on Volta; the graph
+        // SIZE limit is applied at the compute call site (see ggml_cuda_graphs_volta_max_nodes).
+        static const bool allow_volta = getenv("GGML_CUDA_GRAPHS_VOLTA") != nullptr;
+        const int cc_min = allow_volta ? GGML_CUDA_CC_VOLTA : GGML_CUDA_CC_AMPERE;
+        if (ggml_cuda_info().devices[cuda_ctx->device].cc < cc_min) {
             if (!graph->disable_due_to_gpu_arch) {
                 GGML_LOG_DEBUG("%s: disabling CUDA graphs due to GPU architecture\n", __func__);
             }
@@ -4229,8 +4234,19 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 
+    // on Volta, only SMALL graphs win with CUDA graphs (measured: the per-call node-property
+    // comparison makes large ~1800-node graphs a net loss, while a stable ~150-node speculative
+    // drafter graph benefits). GGML_CUDA_GRAPHS_VOLTA=<n> caps the eligible node count (1 = no cap).
+    static const int volta_max_nodes = [] {
+        const char * e = getenv("GGML_CUDA_GRAPHS_VOLTA");
+        return e ? atoi(e) : 0;
+    }();
+    const bool volta_size_ok =
+        ggml_cuda_info().devices[cuda_ctx->device].cc >= GGML_CUDA_CC_AMPERE ||
+        volta_max_nodes == 1 || cgraph->n_nodes <= volta_max_nodes;
+
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
-    if (graph->is_enabled()) {
+    if (graph->is_enabled() && volta_size_ok) {
         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
         if (graph_compatible) {
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);

@@ -40,6 +40,10 @@ struct llama_cparams {
     bool kv_unified;
     bool eagle3_extract_enabled;  // enable layer extraction for EAGLE3 speculative decoding
     bool dflash_extract_enabled;  // enable layer extraction for DFlash speculative decoding
+    bool out_argmax;              // emit on-device argmax of the output logits (greedy verify path)
+    bool out_spec_sample;         // emit on-device temp-softmax prob of each draft token (sampling verify)
+    float spec_temp;              // temperature baked into the in-graph softmax for out_spec_sample
+    int32_t spec_topk;            // >0: emit top-K candidate logits per row (top-k/top-p verify) instead of pdraft
     bool pipeline_parallel;
 
     enum llama_pooling_type pooling_type;
