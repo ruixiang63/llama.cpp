@@ -397,6 +397,20 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
     GGML_ASSERT(b->ne[0] == 1   && b->ne[1] == H_v && b->ne[2] == n_tokens && b->ne[3] == n_seqs);
     GGML_ASSERT(s->ne[0] == S_v && s->ne[1] == S_v && s->ne[2] == H_v      && s->ne[3] == n_seqs);
 
+    // chunk-parallel GDN for a multi-token block (DFlash verify): portable (pure ggml ops) verify of a
+    // small block. Opt-in via LLAMA_GDN_CHUNKED=1. Only when no per-token trace is requested (the
+    // rewind needs per-token state, see GDN_CHUNKED_BRINGUP.md), n_seqs==1, vector/scalar gate, N>1.
+    // Capped to small N: the tiling unrolls ceil(N/16) subgraphs per layer, so a long prefill (the
+    // 512-token ubatch reserve) would explode the static graph -> fall through to the fused op there.
+    static const bool gdn_chunked = getenv("LLAMA_GDN_CHUNKED") &&
+        std::string(getenv("LLAMA_GDN_CHUNKED")) != "0";
+    static const int64_t gdn_chunked_maxn =
+        getenv("LLAMA_GDN_CHUNKED_MAXN") ? atoll(getenv("LLAMA_GDN_CHUNKED_MAXN")) : 128;
+    if (gdn_chunked && gdn_trace == nullptr && n_seqs == 1 && n_tokens > 1 && n_tokens <= gdn_chunked_maxn
+            && (g->ne[0] == S_v || g->ne[0] == 1)) {
+        return build_delta_net_chunked(q, k, v, g, b, s, il);
+    }
+
     ggml_tensor * result;
     if (gdn_trace != nullptr) {
         // per-token state trace requested (DFlash speculative rewind on recurrent targets)
@@ -424,6 +438,100 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
             ggml_row_size(result->type, S_v * S_v * H_v),
             ggml_row_size(result->type, S_v * H_v * n_tokens * n_seqs));
 
+    return {output, new_state};
+}
+
+// One chunk of the chunk-parallel GDN. Returns attn O [token,S_v,H] and carry-out state S_out
+// [i,j,H] (both 3D, pre-reshape) so the tiling wrapper can concat tokens and thread state. Math
+// validated bitwise vs ggml_gated_delta_net in tests/test-gdn-chunked.cpp (vector+scalar gate, GQA).
+std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_net_one_chunk(
+        ggml_tensor * q, ggml_tensor * k, ggml_tensor * v,
+        ggml_tensor * g, ggml_tensor * b, ggml_tensor * s) {
+    const int64_t S_v = v->ne[0];
+    const int64_t H   = v->ne[1];
+    const int64_t N   = v->ne[2];
+    const int64_t Hk  = q->ne[1];
+    const float   scale = 1.0f/sqrtf((float)S_v);
+
+    auto toDNH = [&](ggml_tensor * x){ return ggml_cont(ctx0, ggml_permute(ctx0, x, 0,2,1,3)); }; // [S,Hx,N]->[S,N,Hx]
+    ggml_tensor * qp = toDNH(q), * kp = toDNH(k), * vp = toDNH(v), * gp = toDNH(g);
+    if (Hk != H) { // GQA: broadcast q/k heads Hk->H (interleaved)
+        ggml_tensor * tgt = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, S_v, N, H);
+        qp = ggml_repeat(ctx0, qp, tgt);
+        kp = ggml_repeat(ctx0, kp, tgt);
+    }
+    ggml_tensor * gN = ggml_cont(ctx0, ggml_permute(ctx0, gp, 1,0,2,3));    // [N,S_v,H]
+    ggml_tensor * Lp = ggml_cont(ctx0, ggml_permute(ctx0, ggml_cumsum(ctx0, gN), 1,0,2,3)); // [S_v,N,H]
+    ggml_tensor * A    = ggml_exp(ctx0, Lp);
+    ggml_tensor * Ainv = ggml_exp(ctx0, ggml_neg(ctx0, Lp));
+    // full-size tensor first so a scalar gate's A=[1,N,H] broadcasts into kp/qp=[S_v,N,H]
+    ggml_tensor * Kbar = ggml_mul(ctx0, kp, A);
+    ggml_tensor * Qbar = ggml_mul(ctx0, qp, A);
+    ggml_tensor * Ktil = ggml_mul(ctx0, kp, Ainv);
+    ggml_tensor * betaNH = ggml_cont(ctx0, ggml_permute(ctx0, b, 0,2,1,3)); // [1,N,H]
+    ggml_tensor * Ucar = ggml_mul_mat(ctx0, s, Kbar);                       // [j,r,H]
+    ggml_tensor * Ocar = ggml_scale(ctx0, ggml_mul_mat(ctx0, s, Qbar), scale);
+    ggml_tensor * rhs  = ggml_mul(ctx0, ggml_sub(ctx0, vp, Ucar), betaNH);  // [S_v(j),N(r),H]
+    ggml_tensor * KK   = ggml_mul_mat(ctx0, Ktil, Kbar);                    // [s,r,H]
+    ggml_tensor * Tlo  = ggml_tri(ctx0, ggml_mul(ctx0, KK, betaNH), GGML_TRI_TYPE_LOWER);
+    // identity [N,N] (solve_tri needs an explicit unit diagonal): ones via exp(0*beta), then diag
+    ggml_tensor * b0   = ggml_cont(ctx0, ggml_transpose(ctx0, ggml_view_2d(ctx0, betaNH, 1, N, betaNH->nb[1], 0)));
+    ggml_tensor * ones = ggml_exp(ctx0, ggml_scale(ctx0, b0, 0.0f));        // [N,1] all-ones
+    ggml_tensor * Imat = ggml_diag(ctx0, ones);                            // [N,N]
+    ggml_tensor * ITm  = ggml_add(ctx0, Tlo, Imat);                        // I+T, bcast over H
+    ggml_tensor * Dmat = ggml_cont(ctx0, ggml_transpose(ctx0, ggml_solve_tri(ctx0, ITm, rhs, true, true, false))); // [N(token),S_v(j),H]
+    ggml_tensor * QKlo = ggml_tri(ctx0, ggml_mul_mat(ctx0, Ktil, Qbar), GGML_TRI_TYPE_LOWER_DIAG);
+    ggml_tensor * intra= ggml_scale(ctx0, ggml_mul_mat(ctx0, QKlo, Dmat), scale); // [t,j,H]
+    ggml_tensor * O    = ggml_add(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, Ocar)), intra); // [t,j,H]
+    ggml_tensor * AendB= ggml_cont(ctx0, ggml_view_3d(ctx0, A, A->ne[0], 1, H, A->nb[1], A->nb[2], (N-1)*A->nb[1]));
+    ggml_tensor * S0dec= ggml_mul(ctx0, s, AendB);
+    ggml_tensor * Kw   = ggml_mul(ctx0, kp, ggml_mul(ctx0, Ainv, AendB));
+    ggml_tensor * upd  = ggml_mul_mat(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, Kw)), Dmat);
+    ggml_tensor * S_out= ggml_add(ctx0, S0dec, upd);                       // [i,j,H]
+    return {O, S_out};
+}
+
+std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_net_chunked(
+        ggml_tensor * q, ggml_tensor * k, ggml_tensor * v,
+        ggml_tensor * g, ggml_tensor * b, ggml_tensor * s, int il) {
+    // Chunk-parallel GDN. Pure ggml ops -> portable (CUDA/Metal/Vulkan/WebGPU) for backends without a
+    // fused GDN kernel. The N tokens are tiled into blocks of C, carrying the recurrent state forward,
+    // so Ainv=exp(-cumsum(g)) stays bounded per block: single-chunk over a long prefill overflows fp32.
+    // For a verify block (N<=C) the loop runs once -> identical to the original single-chunk path.
+    const int64_t S_v = v->ne[0];
+    const int64_t H   = v->ne[1];
+    const int64_t N   = v->ne[2];
+    const int64_t Hk  = q->ne[1];
+    // Gate may be per-channel (KDA vector, g->ne[0]==S_v) or per-head scalar (Gated DeltaNet, ==1).
+    GGML_ASSERT((g->ne[0] == S_v || g->ne[0] == 1) && "chunked GDN gate must be vector(S_v) or scalar(1)");
+    GGML_ASSERT(v->ne[3] == 1 && "chunked GDN path is n_seqs==1 only");
+
+    // Block size. The deflation A=exp(+/-cumsum(g)) has a wide dynamic range; strong-decay heads
+    // overflow fp32 precision when a chunk is too long (empirically garbles at C>=16 on Qwen3.5,
+    // clean at C<=8). 8 is the safe default; override with LLAMA_GDN_CHUNK_SIZE.
+    int64_t C = 8;
+    if (const char * e = getenv("LLAMA_GDN_CHUNK_SIZE")) { int64_t c = atoll(e); if (c >= 1) C = c; }
+
+    if (getenv("LLAMA_GDN_CHUNKED_VERBOSE")) {
+        static bool once = false;
+        if (!once) { once = true; fprintf(stderr, "[GDN-CHUNKED] active: N=%lld C=%lld chunks=%lld S_v=%lld H=%lld Hk=%lld gate=%s\n",
+            (long long)N, (long long)C, (long long)((N+C-1)/C), (long long)S_v, (long long)H, (long long)Hk, g->ne[0]==1?"scalar":"vector"); }
+    }
+
+    ggml_tensor * S = s;          // carried recurrent state [S_v,S_v,H,1]
+    ggml_tensor * O_full = nullptr; // attn output, concatenated over tokens [token,S_v,H]
+    for (int64_t start = 0; start < N; start += C) {
+        const int64_t cn = std::min<int64_t>(C, N - start);
+        auto slc = [&](ggml_tensor * x){
+            return ggml_view_4d(ctx0, x, x->ne[0], x->ne[1], cn, 1, x->nb[1], x->nb[2], x->nb[3], start*x->nb[2]);
+        };
+        auto oc = build_delta_net_one_chunk(slc(q), slc(k), slc(v), slc(g), slc(b), S);
+        O_full = O_full ? ggml_concat(ctx0, O_full, oc.first, 0) : oc.first; // concat tokens on ne0
+        S = ggml_reshape_4d(ctx0, oc.second, S_v, S_v, H, 1);
+    }
+    ggml_tensor * output    = ggml_reshape_4d(ctx0, ggml_cont(ctx0, ggml_permute(ctx0, O_full, 2,0,1,3)), S_v, H, N, 1);
+    ggml_tensor * new_state = S;
+    cb(output, LLAMA_TENSOR_NAME_FGDN_CH, il);
     return {output, new_state};
 }
 

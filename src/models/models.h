@@ -55,6 +55,27 @@ struct llm_build_delta_net_base : public llm_graph_context {
                 ggml_tensor * s,
                         int   il);
 
+    // chunk-parallel GDN for a multi-token block (DFlash verify): chunked delta-rule built from
+    // ggml ops (cumsum/tri/solve_tri/mul_mat) - cheap verify of an N-token block + portable.
+    // Returns {output [S_v,H_v,N,1], new_state [S_v,S_v,H_v,1]}. n_seqs==1, KDA gate only.
+    std::pair<ggml_tensor *, ggml_tensor *> build_delta_net_chunked(
+                ggml_tensor * q,
+                ggml_tensor * k,
+                ggml_tensor * v,
+                ggml_tensor * g,
+                ggml_tensor * b,
+                ggml_tensor * s,
+                        int   il);
+
+    // one block of the tiled chunk-parallel GDN; returns attn [token,S_v,H] and state [i,j,H]
+    std::pair<ggml_tensor *, ggml_tensor *> build_delta_net_one_chunk(
+                ggml_tensor * q,
+                ggml_tensor * k,
+                ggml_tensor * v,
+                ggml_tensor * g,
+                ggml_tensor * b,
+                ggml_tensor * s);
+
     // choose one of two implementations above based on the number of tokens
     std::pair<ggml_tensor *, ggml_tensor *> build_delta_net(
                 ggml_tensor * q,

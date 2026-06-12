@@ -769,6 +769,16 @@ struct ggml_backend_sched_split {
     int n_inputs;
     // graph view of this split
     struct ggml_cgraph graph;
+
+    // stable-uid bookkeeping (see ggml_backend_sched_split_graph): when a re-split produces a
+    // byte-identical split (same backend, node count, and head/tail node pointers) we reuse the
+    // previous uid instead of minting a fresh one. A stable uid lets graph-capturing backends
+    // (CUDA graphs) hit their uid fast-path and skip the per-node property walk every round, which
+    // is the dominant CPU overhead for a stable speculative-verify graph. This is purely a hint:
+    // a matching uid only lets the backend skip a walk that would have found no change anyway, and
+    // a non-matching uid always falls back to the full walk, so correctness is unaffected.
+    uint64_t prev_uid; // uid assigned on the previous split_graph for this slot (0 = none)
+    uint64_t prev_sig; // topology signature of the previous split for this slot
 };
 
 struct ggml_backend_sched {
@@ -1304,10 +1314,14 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 split->i_end = i;
                 i_split++;
                 if (i_split >= sched->splits_capacity) {
+                    const int prev_capacity = sched->splits_capacity;
                     sched->splits_capacity *= 2;
                     sched->splits = (ggml_backend_sched_split *)
                         realloc(sched->splits, sched->splits_capacity * sizeof(struct ggml_backend_sched_split));
                     GGML_ASSERT(sched->splits != NULL);
+                    // zero the newly grown slots so the stable-uid prev_uid/prev_sig start clean
+                    memset(&sched->splits[prev_capacity], 0,
+                           (sched->splits_capacity - prev_capacity) * sizeof(struct ggml_backend_sched_split));
                 }
                 split = &sched->splits[i_split];
                 split->backend_id = node_backend_id;
@@ -1481,8 +1495,50 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     }
 
     // set ids for all splits
+    //
+    // stable-uid optimization: if this split slot is byte-identical to the previous split_graph
+    // (same backend, node count, and a strided sample of node pointers - sufficient because nodes
+    // are placement-allocated at stable offsets in the reused compute buffer, so an unchanged
+    // topology re-materializes the exact same tensor pointers), reuse the previous uid. This lets
+    // graph-capturing backends (CUDA graphs) take their uid fast-path and skip the O(n_nodes)
+    // property walk + warmup churn every round - the dominant per-round CPU cost for a stable
+    // speculative-verify graph that re-splits because the higher-level graph-reuse check missed.
+    // Opt out with GGML_SCHED_STABLE_UID=0. Hint only: a reused uid merely skips a walk that would
+    // have found no change; any mismatch falls back to the full walk, so correctness is unaffected.
+    static const bool stable_uid = [] {
+        const char * e = getenv("GGML_SCHED_STABLE_UID");
+        return e == nullptr || atoi(e) != 0; // on by default
+    }();
     for (int i = 0; i < sched->n_splits; ++i) {
-        sched->splits[i].graph.uid = ggml_graph_next_uid();
+        struct ggml_backend_sched_split * split = &sched->splits[i];
+
+        uint64_t sig = 0;
+        if (stable_uid && split->graph.n_nodes > 0) {
+            // cheap topology signature: backend + node count + a strided sample of node pointers
+            // (head, tail, and up to ~16 interior nodes). Nodes are placement-allocated at stable
+            // offsets in the reused compute buffer, so an unchanged topology re-materializes the
+            // exact same pointers; ANY topology change shifts the count and/or these offsets. The
+            // interior sampling makes a same-count/same-endpoints-but-different-middle collision
+            // (which would let the backend reuse a stale captured graph) effectively impossible.
+            const int     n    = split->graph.n_nodes;
+            const int     step = n > 16 ? n / 16 : 1;
+            sig = (uint64_t) (uint32_t) split->backend_id;
+            sig = sig * 1099511628211ull + (uint64_t) n;
+            for (int k = 0; k < n; k += step) {
+                sig = sig * 1099511628211ull + (uint64_t) (uintptr_t) split->graph.nodes[k];
+            }
+            sig = sig * 1099511628211ull + (uint64_t) (uintptr_t) split->graph.nodes[n - 1];
+        }
+
+        if (stable_uid && sig != 0 && sig == split->prev_sig && split->prev_uid != 0) {
+            // identical to last time - keep the previous uid so the backend graph fast-path fires
+            split->graph.uid = split->prev_uid;
+        } else {
+            split->graph.uid = ggml_graph_next_uid();
+        }
+
+        split->prev_uid = split->graph.uid;
+        split->prev_sig = sig;
     }
 }
 

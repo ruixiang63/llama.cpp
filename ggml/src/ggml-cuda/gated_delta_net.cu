@@ -278,6 +278,16 @@ void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor *
 
     cudaStream_t stream = ctx.stream();
 
+    // [TAG_GDN_CHUNKED] DFlash verify fast path: chunk-parallel GDN (see DESIGN.md + gated_delta_net_chunked.cu).
+    // When implemented & validated, route the single-sequence verify block here to cut sequential depth N -> ceil(N/C):
+    //   if (n_seqs == 1 && n_tokens >= GDN_CHUNK_MIN && n_tokens <= GDN_CHUNK_MAX
+    //                   && S_v <= GDN_CHUNK_DMAX && trace_d == nullptr) {
+    //       if (kda) launch_gated_delta_net_chunked<true >(q_d,k_d,v_d,g_d,b_d,s_d,dst_d,trace_d, S_v,H,n_tokens, sq1,sq2,sv1,sv2,sb1,sb2, scale,stream);
+    //       else     launch_gated_delta_net_chunked<false>(q_d,k_d,v_d,g_d,b_d,s_d,dst_d,trace_d, S_v,H,n_tokens, sq1,sq2,sv1,sv2,sb1,sb2, scale,stream);
+    //       return;
+    //   }
+    // (left disabled until the skeleton is made compilable + bitwise-validated against this sequential kernel.)
+
     if (kda) {
         launch_gated_delta_net<true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, trace_d,
             S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
