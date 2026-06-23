@@ -33,6 +33,9 @@ llama_tokens common_speculative_draft(
 // informs the speculative decoder that n_accepted tokens were accepted by the target model
 void common_speculative_accept(common_speculative * spec, uint16_t n_accepted);
 
+// the DFlash decoder context, if a DFlash implementation is active (nullptr otherwise)
+llama_context * common_speculative_get_dflash_decoder(common_speculative * spec);
+
 // print statistics about the speculative decoding
 void common_speculative_print_stats(const common_speculative * spec);
 

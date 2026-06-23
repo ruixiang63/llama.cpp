@@ -938,6 +938,89 @@ extern "C" {
                        int32_t   n_embd,
                        int32_t   n_tokens);
 
+    // DFlash recurrent rewind (staging): enable per-token recurrent state tracing during multi-token
+    // (verify) decodes on a hybrid target, up to n_max tokens per decode
+    LLAMA_API void llama_set_dflash_state_trace(
+            struct llama_context * ctx,
+                       int32_t   n_max);
+
+    // promote the traced state at token index `idx` of the last verify decode into the live
+    // recurrent state of seq 0, marking it as ending at position `pos_last`. after this, a partial
+    // llama_memory_seq_rm(seq 0, pos_last+1, -1) succeeds on the hybrid memory and no re-decode of
+    // the accepted tokens is needed. returns false if tracing is not enabled or idx is out of range
+    LLAMA_API bool llama_dflash_promote_state(
+            struct llama_context * ctx,
+                       int32_t   idx,
+                     llama_pos   pos_last,
+                  llama_seq_id   seq_id);
+
+    // debug: bitwise-compare the last traced state slot against the live recurrent cell
+    LLAMA_API bool llama_dflash_trace_check(
+            struct llama_context * ctx,
+                       int32_t   n_batch_tokens);
+
+    // greedy argmax of the DFlash drafter's last decoded block, computed on-device
+    // (avoids the n_vocab x block logits host copy). returns nullptr if not produced;
+    // n_out receives the number of entries (= block tokens)
+    LLAMA_API const int32_t * llama_get_dflash_argmax(
+            struct llama_context * ctx,
+                       int32_t * n_out);
+
+    // emit on-device argmax of the output logits and skip the host logits copy (greedy
+    // speculative verify: only the per-position argmax is needed to accept/reject drafts).
+    // read the result via llama_get_dflash_argmax
+    LLAMA_API void llama_set_out_argmax(
+            struct llama_context * ctx,
+                          bool   value);
+
+    // sampling speculative verify: emit on-device temp-softmax probability of each draft token
+    // (the next verify-batch token at each position), with the temperature baked into the graph.
+    // The host does the cheap rejection test on these probs and fetches a single logits row for
+    // the residual/bonus sample, instead of downloading the whole n_vocab x block logits matrix.
+    // temp baked into the in-graph softmax; topk>0 emits top-K candidate logits per row instead
+    // of the temperature-only per-draft-token probability (enables on-device top-k/top-p verify)
+    LLAMA_API void llama_set_out_spec_sample(
+            struct llama_context * ctx,
+                          bool   value,
+                         float   temp,
+                       int32_t   topk);
+
+    // per-draft-token temp-softmax probabilities from the last decode (n_out = output rows)
+    LLAMA_API const float * llama_get_dflash_pdraft(
+            struct llama_context * ctx,
+                       int32_t * n_out);
+
+    // per-row top-K candidate token ids (row-major [n_rows][k]); their logits via *vals
+    LLAMA_API const int32_t * llama_get_dflash_topk(
+            struct llama_context * ctx,
+                       int32_t * n_rows,
+                       int32_t * k,
+                  const float ** vals);
+
+    // fetch a single row of the device-resident verify logits (residual/bonus sampling on reject)
+    LLAMA_API bool llama_dflash_fetch_logits_row(
+            struct llama_context * ctx,
+                       int32_t   row,
+                         float * out,
+                       int32_t   n_vocab);
+
+    // DFlash decoder: stage the NEW tokens' raw target features; the decoder graph encodes them
+    // (fc+norm) and appends into the device-resident context cache - replaces the separate
+    // encoder llama_encode + llama_set_dflash_accumulated_target_ctx round trip per draft
+    LLAMA_API void llama_dflash_append_features(
+            struct llama_context * ctx,
+                   const float * feat,
+                       int32_t   n_new,
+                       int32_t   n_total);
+
+    // async draft feed: hand the drafter's on-device argmax tokens to the target context
+    // device-to-device (the verify batch is then submitted with placeholder tokens which get
+    // patched on-device) - removes the host synchronization between draft and verify
+    LLAMA_API bool llama_dflash_feed_draft_tokens(
+            struct llama_context * ctx_tgt,
+            struct llama_context * ctx_dft,
+                       int32_t   n);
+
     //
     // Decoding
     //

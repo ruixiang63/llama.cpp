@@ -92,6 +92,17 @@ struct server_slot {
     server_prompt_checkpoint spec_ckpt;
     common_speculative_ptr spec;
 
+    // DFlash recurrent rewind: when set, the target's per-token recurrent states are traced during
+    // the verify decode so a partial acceptance promotes the state at the accepted position on-device
+    // instead of the ~50 MiB host checkpoint round-trip + re-decode (see llama_dflash_promote_state)
+    bool spec_state_trace = false;
+    // DFlash GPU greedy verify: when the request samples a raw argmax (pure greedy, no penalties/
+    // grammar/logit-bias/n_probs), the target decode emits an on-device argmax of the verify block
+    // and the host skips the ~n_vocab x block logits download + CPU sampler. Lossless for greedy.
+    bool spec_gpu_verify = false;
+    bool spec_argmax_active = false; // out_argmax currently enabled on slot.ctx (after the first sample)
+    llama_pos spec_pos0 = 0; // base position of the current verify batch (rewind target = pos0 + accepted)
+
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
     std::unique_ptr<const server_task> task;
@@ -363,7 +374,9 @@ struct server_slot {
                     spec_draft.clear();
                 }
 
-                if (!spec_draft.empty() && ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
+                // the host checkpoint is only needed for the restore-based rewind; with the
+                // on-device state trace a partial acceptance promotes the state instead (no host copy)
+                if (!spec_draft.empty() && ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL && !spec_state_trace) {
                     const auto n_tokens = prompt.tokens.size();
 
                     spec_ckpt = server_get_checkpoint(ctx, this->id, n_tokens);
@@ -396,6 +409,7 @@ struct server_slot {
             }
 
             auto pos0 = prompt.tokens.pos_next();
+            spec_pos0 = pos0; // base position of the verify batch (for the DFlash on-device rewind)
 
             common_batch_add(batch, sampled, pos0++, { this->id }, true);
             for (auto token : spec_draft) {
@@ -929,6 +943,20 @@ private:
 
                 if (slot.spec) {
                     SLT_INF(slot, "%s", "speculative decoding context initialized\n");
+
+                    // DFlash on a hybrid/recurrent target: enable the recurrent state trace so a
+                    // partial acceptance promotes the accepted-position state on-device instead of
+                    // the host checkpoint round-trip. Only for the FULL-seq-rm regime (hybrid), and
+                    // only at n_parallel == 1 (the per-context feature extraction limitation above).
+                    const bool trace_ok = params_base.speculative.dflash &&
+                                          ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL &&
+                                          params_base.n_parallel == 1;
+                    if (trace_ok &&
+                        !(getenv("LLAMA_SPEC_NO_TRACE") && std::string(getenv("LLAMA_SPEC_NO_TRACE")) != "0")) {
+                        llama_set_dflash_state_trace(slot.ctx, params_base.speculative.n_max + 1);
+                        slot.spec_state_trace = true;
+                        SLT_INF(slot, "%s", "DFlash recurrent state trace enabled (on-device rewind)\n");
+                    }
                 }
             }
 
@@ -1341,6 +1369,30 @@ private:
                 llama_set_sampler(ctx, slot.id, common_sampler_get(slot.smpl.get()));
             } else {
                 llama_set_sampler(ctx, slot.id, nullptr);
+            }
+
+            // DFlash GPU greedy verify: when this request samples a raw argmax (pure greedy: temp<=0,
+            // no penalties / DRY / grammar / logit-bias / n_probs), turn on the target's on-device
+            // argmax so the verify reads block_size+1 ints instead of downloading block_size+1 x n_vocab
+            // logits and running the host sampler. Lossless for greedy; falls back to the host path
+            // otherwise. Toggled per request (out_argmax change triggers a one-off graph reserve).
+            {
+                const auto & sp = task.params.sampling;
+                const bool pure_greedy =
+                    sp.temp <= 0.0f && sp.penalty_repeat == 1.0f && sp.penalty_freq == 0.0f &&
+                    sp.penalty_present == 0.0f && sp.dry_multiplier == 0.0f && sp.grammar.empty() &&
+                    sp.logit_bias.empty() && sp.n_probs == 0;
+                slot.spec_gpu_verify = params_base.speculative.dflash && params_base.n_parallel == 1 &&
+                    pure_greedy &&
+                    !(getenv("LLAMA_SPEC_NO_GPU_VERIFY") && std::string(getenv("LLAMA_SPEC_NO_GPU_VERIFY")) != "0");
+                // out_argmax is turned ON only after the first token is sampled from logits (like
+                // speculative-simple): the prompt's first sample needs raw logits, the verify loop
+                // afterwards reads the on-device argmax. Reset here for a fresh request on the slot.
+                llama_set_out_argmax(slot.ctx, false);
+                slot.spec_argmax_active = false;
+                if (slot.spec_gpu_verify) {
+                    SLT_INF(slot, "%s", "DFlash GPU greedy verify enabled (on-device argmax)\n");
+                }
             }
 
             SLT_INF(slot, "sampler chain: %s\n", common_sampler_print(slot.smpl.get()).c_str());
@@ -2933,7 +2985,22 @@ private:
 
                 const int tok_idx = slot.i_batch - i;
 
-                llama_token id = common_sampler_sample(slot.smpl.get(), slot.ctx, tok_idx);
+                llama_token id;
+                if (slot.spec_gpu_verify && slot.spec_argmax_active) {
+                    // out_argmax already on (a rare empty-draft round after the first token): read the
+                    // target's on-device argmax for this output row instead of the (unavailable) logits
+                    int32_t n_am = 0;
+                    const int32_t * am = llama_get_dflash_argmax(slot.ctx, &n_am);
+                    GGML_ASSERT(am != nullptr && tok_idx < n_am && "DFlash target argmax missing");
+                    id = (llama_token) am[tok_idx];
+                } else {
+                    id = common_sampler_sample(slot.smpl.get(), slot.ctx, tok_idx);
+                    // first sample done from logits -> enable on-device argmax for the verify loop
+                    if (slot.spec_gpu_verify && !slot.spec_argmax_active) {
+                        llama_set_out_argmax(slot.ctx, true);
+                        slot.spec_argmax_active = true;
+                    }
+                }
 
                 slot.i_batch = -1;
 
@@ -2987,14 +3054,45 @@ private:
                 {
                     const bool use_ckpt = slot.ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
-                    // only save the sampler sampler state if we use checkpoints
+                    // only save the sampler state if we use the checkpoint-restore rewind; the
+                    // on-device trace rewind commits forward and never rolls the sampler back
                     common_sampler_ptr smpl_save;
-                    if (use_ckpt) {
+                    if (use_ckpt && !slot.spec_state_trace) {
                         smpl_save.reset(common_sampler_clone(slot.smpl.get()));
                     }
 
                     GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
-                    auto accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx, slot.spec_i_batch, slot.spec_draft);
+                    llama_tokens accepted;
+                    if (slot.spec_gpu_verify) {
+                        // greedy accept from the target's on-device argmax (DFlash sets output_all, so
+                        // the argmax row == the verify token's batch index in spec_i_batch). Same
+                        // semantics as common_sampler_sample_and_accept_n with a greedy sampler: take
+                        // the target token at each position up to and including the first mismatch, plus
+                        // a bonus token if every draft matched. Skips the per-block logits download.
+                        int32_t n_am = 0;
+                        const int32_t * am = llama_get_dflash_argmax(slot.ctx, &n_am);
+                        GGML_ASSERT(am != nullptr && "DFlash target argmax missing");
+                        size_t k = 0;
+                        for (; k < slot.spec_draft.size(); ++k) {
+                            const int32_t row = slot.spec_i_batch[k];
+                            GGML_ASSERT(row < n_am);
+                            const llama_token t = (llama_token) am[row];
+                            accepted.push_back(t);
+                            common_sampler_accept(slot.smpl.get(), t, true);
+                            if (slot.spec_draft[k] != t) {
+                                break;
+                            }
+                        }
+                        if (k == slot.spec_draft.size()) { // all drafts matched -> bonus token
+                            const int32_t row = slot.spec_i_batch[k];
+                            GGML_ASSERT(row < n_am);
+                            const llama_token t = (llama_token) am[row];
+                            accepted.push_back(t);
+                            common_sampler_accept(slot.smpl.get(), t, true);
+                        }
+                    } else {
+                        accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx, slot.spec_i_batch, slot.spec_draft);
+                    }
                     slot.spec_i_batch.clear();
 
                     SLT_DBG(slot, "%s: n_draft=%zu, accepted=%zu\n", __func__, slot.spec_draft.size(), accepted.size());
@@ -3003,7 +3101,22 @@ private:
 
                     // check for partial draft acceptance
                     if (accepted.size() < slot.spec_draft.size() + 1) {
-                        if (use_ckpt) {
+                        if (slot.spec_state_trace) {
+                            // DFlash recurrent rewind: promote the traced state at the accepted
+                            // position instead of restoring a host checkpoint. The verify batch was
+                            // [sampled @ pos0, draft0 @ pos0+1, ...]; accepting `acc` drafts means the
+                            // state after batch token `acc` (trace slot `acc`, ending at pos0 + acc)
+                            // is correct. Then fall through to the normal commit path below - its
+                            // llama_memory_seq_rm(pos) truncates the rejected attention KV tail and
+                            // now succeeds because the recurrent cell pos was rewound.
+                            const int32_t   acc      = (int32_t) accepted.size() - 1;
+                            const llama_pos pos_last = slot.spec_pos0 + acc;
+
+                            if (!llama_dflash_promote_state(slot.ctx, acc, pos_last, slot.id)) {
+                                GGML_ABORT("%s: DFlash state promote failed (idx=%d)\n", __func__, acc);
+                            }
+                            // no checkpoint restore, no `continue` - fall through to commit
+                        } else if (use_ckpt) {
                             // partial acceptance is not supported by the context -> truncate the draft and restore the state
                             slot.spec_draft = std::move(accepted);
 

@@ -2539,6 +2539,21 @@ extern "C" {
             struct ggml_tensor  * beta,
             struct ggml_tensor  * state);
 
+    // same as ggml_gated_delta_net, but additionally stores the recurrent state after EVERY token
+    // into `trace` (F32, contiguous, S_v*S_v*H*n_tokens elements; the state after token t lands at
+    // offset t*S_v*S_v*H, same transposed layout as the final state). requires n_seqs == 1.
+    // used for speculative decoding on recurrent models: on a partial draft acceptance the traced
+    // state at the accepted position is promoted into the cache instead of re-decoding (rewind).
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_trace(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * g,
+            struct ggml_tensor  * beta,
+            struct ggml_tensor  * state,
+            struct ggml_tensor  * trace);
+
     // custom operators
 
     typedef void (*ggml_custom1_op_t)(struct ggml_tensor * dst , const struct ggml_tensor * a, int ith, int nth, void * userdata);

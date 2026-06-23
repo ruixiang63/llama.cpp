@@ -10551,6 +10551,12 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
                 attn_data[j] = sum * scale;
             }
 
+            // optional per-token state trace (speculative-decoding rewind); n_seqs == 1 enforced upstream
+            if (dst->src[6]) {
+                float * tr = (float *) dst->src[6]->data + ((int64_t) t * H + iv1) * S_v * S_v;
+                memcpy(tr, s_out, S_v * S_v * sizeof(float));
+            }
+
             attn_data += S_v * H; // advance to next token
         }
     }

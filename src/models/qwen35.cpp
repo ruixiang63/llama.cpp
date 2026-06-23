@@ -290,6 +290,33 @@ ggml_tensor * llm_build_qwen35::build_layer_attn_linear(
 
     ggml_build_forward_expand(gf, ggml_cpy(ctx0, last_conv_states, state_update_target));
 
+    // DFlash recurrent rewind (staging): during the speculative verify decode, capture the per-token
+    // conv windows and (below, via gdn_trace) the per-token SSM states, so that on a partial draft
+    // acceptance the state at the accepted position is PROMOTED instead of restore+re-decode.
+    const bool dflash_trace = dflash != nullptr && dflash->trace_n_max > 0 &&
+        n_seqs == 1 && n_seq_tokens > 1 && n_seq_tokens <= dflash->trace_n_max &&
+        cparams.fused_gdn_ch &&
+        (size_t) il < dflash->trace_s.size() && dflash->trace_s[il] != nullptr;
+
+    if (dflash_trace) {
+        // conv window after token t = rows [t+1 .. t+conv_kernel_size-1] of conv_input (the same
+        // view pattern as last_conv_states above). One clean in-bounds sub-view copy per token:
+        // an earlier single-overlapping-3D-view optimization sat exactly on the buffer boundary
+        // (data_size + offset == ggml_nbytes(conv_input)) and aborted in ggml_view_3d whenever
+        // conv_input had a different row count than (k-1)+n_seq_tokens (observed on sm_120 and in
+        // the server's prompt-chunk path). The per-token windows are always strictly in bounds.
+        const int64_t conv_sz = (conv_kernel_size - 1) * conv_channels; // == hparams.n_embd_r()
+        for (int64_t t = 0; t < n_seq_tokens; ++t) {
+            ggml_tensor * win = ggml_view_3d(ctx0, conv_input,
+                    conv_kernel_size - 1, conv_channels, 1,
+                    conv_input->nb[1], conv_input->nb[2],
+                    (t + 1) * ggml_element_size(conv_input));
+            ggml_tensor * dst_t = ggml_view_1d(ctx0, dflash->trace_r[il], conv_sz,
+                    (size_t) t * conv_sz * ggml_element_size(dflash->trace_r[il]));
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, win, dst_t));
+        }
+    }
+
     ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
     state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
     cb(state, "state_predelta", il);
@@ -349,6 +376,11 @@ ggml_tensor * llm_build_qwen35::build_layer_attn_linear(
     cb(q_conv, "q_conv_predelta", il);
     cb(k_conv, "k_conv_predelta", il);
     cb(v_conv, "v_conv_predelta", il);
+
+    if (dflash_trace) {
+        // per-token SSM state trace target, consumed by the fused GDN op (see ggml_gated_delta_net_trace)
+        gdn_trace = ggml_view_1d(ctx0, dflash->trace_s[il], hparams.n_embd_s() * n_seq_tokens, 0);
+    }
 
     auto attn_out = build_delta_net(q_conv, k_conv, v_conv, gate, beta, state, il);
 
