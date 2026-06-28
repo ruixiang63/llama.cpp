@@ -1031,6 +1031,28 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         const int32_t n_ubatch = (int32_t) llama_n_ubatch(ctx_dft);
 
+        // VL support: handle position gaps from image/audio embeddings.
+        // Embedding batches are skipped (line ~1008), so the draft KV cache
+        // misses positions filled by image tokens in the target. Detect any
+        // non-consecutive position and clear the draft sequence so processing
+        // can rebuild from the current text position.
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            if (i_batch_beg[seq_id] < 0) {
+                continue;
+            }
+            GGML_ASSERT(batch_in.embd == nullptr);
+            const llama_pos dft_pos_max = llama_memory_seq_pos_max(
+                    llama_get_memory(ctx_dft), seq_id);
+            const llama_pos batch_pos = batch_in.pos[i_batch_beg[seq_id]];
+            if (dft_pos_max >= 0 && batch_pos != dft_pos_max + 1) {
+                LOG_DBG("%s: non-consecutive pos for seq %d "
+                        "(dft_pos_max=%d, batch_pos=%d) — clearing draft\n",
+                        __func__, (int) seq_id,
+                        (int) dft_pos_max, (int) batch_pos);
+                llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, -1, -1);
+            }
+        }
+
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_batch_beg[seq_id] < 0) {
                 continue;
