@@ -154,6 +154,12 @@ ggml_tensor * llm_build_mamba_base::build_mamba2_layer(llm_graph_input_rs * inp,
     const auto * mctx_cur = inp->mctx;
 
     const auto kv_head = mctx_cur->get_head();
+    const uint32_t mem_size = mctx_cur->get_size();
+
+    // number of recurrent-state snapshots to emit for bounded rollback (>= 1).
+    // when n_rs_seq > 0 (e.g. speculative decoding), emit (n_rs_seq + 1) per-token snapshots
+    // so the last accepted position can be restored without a full-state checkpoint copy.
+    const int64_t k_snap = (cparams.n_rs_seq > 0) ? (int64_t) cparams.n_rs_seq + 1 : 1;
 
     const int64_t d_conv   = hparams.ssm_d_conv;
     const int64_t d_inner  = hparams.ssm_d_inner;
@@ -198,15 +204,21 @@ ggml_tensor * llm_build_mamba_base::build_mamba2_layer(llm_graph_input_rs * inp,
         // => {d_conv - 1 + n_seq_tokens, d_inner + 2*n_group*d_state, n_seqs}
         ggml_tensor * conv_x = ggml_concat(ctx0, conv, ggml_transpose(ctx0, xBC), 0);
 
-        // copy last (d_conv - 1) columns back into the state cache
-        ggml_tensor * last_conv = ggml_view_3d(ctx0, conv_x, d_conv - 1, d_inner + 2 * n_group * d_state, n_seqs,
-                                               conv_x->nb[1], conv_x->nb[2], n_seq_tokens * (conv_x->nb[0]));
+        // copy the last (d_conv - 1) columns back into the state cache.
+        // with rollback enabled (k_snap > 1) write the last min(n_seq_tokens, k_snap) snapshots:
+        // snapshot b holds the conv state b tokens before the end, stored in ring slot b.
+        const int64_t conv_state_size = (d_conv - 1) * (d_inner + 2 * n_group * d_state);
+        const int64_t conv_k_written  = n_seq_tokens < k_snap ? n_seq_tokens : k_snap;
+        for (int64_t b = 0; b < conv_k_written; ++b) {
+            ggml_tensor * conv_state_b = ggml_view_3d(ctx0, conv_x, d_conv - 1, d_inner + 2 * n_group * d_state, n_seqs,
+                                                      conv_x->nb[1], conv_x->nb[2], (n_seq_tokens - b) * (conv_x->nb[0]));
 
-        ggml_build_forward_expand(gf, ggml_cpy(ctx0, last_conv,
-                                               ggml_view_1d(ctx0, conv_states_all,
-                                                            (d_conv - 1) * (d_inner + 2 * n_group * d_state) * (n_seqs),
-                                                            kv_head * (d_conv - 1) * (d_inner + 2 * n_group * d_state) *
-                                                                ggml_element_size(conv_states_all))));
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, conv_state_b,
+                                                   ggml_view_1d(ctx0, conv_states_all,
+                                                                conv_state_size * n_seqs,
+                                                                (b * (int64_t) mem_size + kv_head) * conv_state_size *
+                                                                    ggml_element_size(conv_states_all))));
+        }
 
         // 1D convolution
         // The equivalent is to make a self-overlapping view of conv_x
@@ -244,20 +256,31 @@ ggml_tensor * llm_build_mamba_base::build_mamba2_layer(llm_graph_input_rs * inp,
         // (this is necessary in order to properly use the states before they are overwritten,
         //  while avoiding to make unnecessary copies of the states)
         auto get_ssm_rows = [&](ggml_context * ctx, ggml_tensor * states, ggml_tensor * ids) {
-            ggml_tensor * ssm = ggml_reshape_4d(ctx, states, d_state, head_dim, n_head, mctx_cur->get_size());
+            // states->ne[1] is the total number of recurrent cells (mem_size * (1 + n_rs_seq)
+            // when rollback snapshots are enabled), which mctx_cur->get_size() does not include.
+            ggml_tensor * ssm = ggml_reshape_4d(ctx, states, d_state, head_dim, n_head, states->ne[1]);
 
             // TODO: use semistructured matrices to implement state-space duality
             // => {d_inner, n_seq_tokens, n_seqs} and {d_state, d_inner, n_seqs}
-            return ggml_ssm_scan(ctx, ssm, x, dt, A, B, C, ids);
+            // emit k_snap trailing state snapshots for bounded recurrent-state rollback
+            return ggml_ssm_scan_ext(ctx, ssm, x, dt, A, B, C, ids, k_snap);
         };
 
         ggml_tensor * y_ssm = build_rs(inp, ssm_states_all, hparams.n_embd_s(), ubatch.n_seqs, get_ssm_rows);
 
-        // store last states
-        ggml_build_forward_expand(
-            gf, ggml_cpy(ctx0, ggml_view_1d(ctx0, y_ssm, d_state * d_inner * n_seqs, ggml_nelements(x) * x->nb[0]),
-                         ggml_view_1d(ctx0, ssm_states_all, d_state * d_inner * n_seqs,
-                                      kv_head * d_state * d_inner * ggml_element_size(ssm_states_all))));
+        // store the produced state snapshots back into the recurrent cache.
+        // slot 0 is the final state; slot b holds the state b tokens before the end (ring slot b).
+        const int64_t ssm_state_size = d_state * d_inner; // per-seq ssm state size
+        const int64_t ssm_k_written  = n_seq_tokens < k_snap ? n_seq_tokens : k_snap;
+        for (int64_t b = 0; b < ssm_k_written; ++b) {
+            ggml_build_forward_expand(
+                gf, ggml_cpy(ctx0,
+                    ggml_view_1d(ctx0, y_ssm, ssm_state_size * n_seqs,
+                                 (ggml_nelements(x) + b * ssm_state_size * n_seqs) * x->nb[0]),
+                    ggml_view_1d(ctx0, ssm_states_all, ssm_state_size * n_seqs,
+                                 (b * (int64_t) mem_size + kv_head) * ssm_state_size *
+                                     ggml_element_size(ssm_states_all))));
+        }
 
         ggml_tensor * y = ggml_view_4d(ctx0, y_ssm, head_dim, n_head, n_seq_tokens, n_seqs, x->nb[1], n_head * x->nb[1],
                                        n_seq_tokens * n_head * x->nb[1], 0);

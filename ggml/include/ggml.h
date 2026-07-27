@@ -2461,6 +2461,22 @@ extern "C" {
             struct ggml_tensor  * C,
             struct ggml_tensor  * ids);
 
+    // like ggml_ssm_scan, but the output packs the per-token y followed by the last
+    // n_snapshots recurrent-state snapshots (most-recent first: slot 0 = final state,
+    // slot s = state s tokens back). n_snapshots == 1 is identical to ggml_ssm_scan.
+    // when n_seq_tokens < n_snapshots only slots 0..n_seq_tokens-1 are written.
+    // used for bounded recurrent-state rollback in speculative decoding.
+    GGML_API struct ggml_tensor * ggml_ssm_scan_ext(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * s,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * dt,
+            struct ggml_tensor  * A,
+            struct ggml_tensor  * B,
+            struct ggml_tensor  * C,
+            struct ggml_tensor  * ids,
+            int64_t               n_snapshots);
+
     // partition into non-overlapping windows with padding if needed
     // example:
     // a:   768   64   64    1

@@ -5589,6 +5589,20 @@ struct ggml_tensor * ggml_ssm_scan(
         struct ggml_tensor  * B,
         struct ggml_tensor  * C,
         struct ggml_tensor  * ids) {
+    return ggml_ssm_scan_ext(ctx, s, x, dt, A, B, C, ids, 1);
+}
+
+struct ggml_tensor * ggml_ssm_scan_ext(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * s,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * dt,
+        struct ggml_tensor  * A,
+        struct ggml_tensor  * B,
+        struct ggml_tensor  * C,
+        struct ggml_tensor  * ids,
+        int64_t               n_snapshots) {
+    GGML_ASSERT(n_snapshots >= 1);
     GGML_ASSERT(ggml_is_contiguous(s));
     GGML_ASSERT(ggml_is_contiguous(dt));
     GGML_ASSERT(ggml_is_contiguous(A));
@@ -5628,8 +5642,11 @@ struct ggml_tensor * ggml_ssm_scan(
         }
     }
 
-    // concatenated y + ssm_states
-    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ggml_nelements(x) + s->ne[0]*s->ne[1]*s->ne[2]*ids->ne[0]);
+    // concatenated y + n_snapshots * ssm_states
+    const int64_t state_size = s->ne[0]*s->ne[1]*s->ne[2]*ids->ne[0];
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ggml_nelements(x) + n_snapshots*state_size);
+
+    ggml_set_op_params_i32(result, 0, (int32_t) n_snapshots);
 
     result->op   = GGML_OP_SSM_SCAN;
     result->src[0] = s;
