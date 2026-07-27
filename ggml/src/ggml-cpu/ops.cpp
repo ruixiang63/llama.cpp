@@ -9645,10 +9645,16 @@ static void ggml_compute_forward_ssm_scan_f32(
     const int64_t nt = src1->ne[2]; // number of tokens per sequence
     const int64_t ns = src1->ne[3]; // number of sequences in the batch
 
+    // number of recurrent-state snapshots packed after y (>= 1); slot 0 is the final state
+    int64_t n_snapshots = ggml_get_op_params_i32(dst, 0);
+    if (n_snapshots < 1) {
+        n_snapshots = 1;
+    }
+
     // can't use ggml_nbytes because src1 is not necessarily contiguous
     const int64_t s_off = ggml_nelements(src1) * ggml_element_size(src1);
 
-    GGML_ASSERT(ggml_nelements(src1) + nc*nr*nh*ns == ggml_nelements(dst));
+    GGML_ASSERT(ggml_nelements(src1) + n_snapshots*nc*nr*nh*ns == ggml_nelements(dst));
     GGML_ASSERT(src0->nb[0] == sizeof(float));
     GGML_ASSERT(src1->nb[0] == sizeof(float));
     GGML_ASSERT(src2->nb[0] == sizeof(float));
@@ -9831,6 +9837,21 @@ static void ggml_compute_forward_ssm_scan_f32(
                     }
                 }
             }
+
+            // emit recurrent-state snapshots for bounded rollback:
+            // slot 0 is the final state (already written in-place to `s`); slot `back` holds the
+            // state `back` tokens before the end. each thread copies only its own head range.
+            if (n_snapshots > 1) {
+                const int64_t back = (nt - 1) - i2; // tokens back from the final token
+                if (back >= 1 && back < n_snapshots) {
+                    const int64_t state_per_seq = nc*nr*nh;                    // floats per sequence
+                    const int64_t head_off      = (int64_t) ih0*nr*nc;         // this thread's head range
+                    const int64_t head_len      = (int64_t) (ih1 - ih0)*nr*nc;
+                    float * snap = (float *) ((char *) dst->data + s_off) + (back*ns + i3)*state_per_seq;
+                    memcpy(snap + head_off, s + head_off, head_len*sizeof(float));
+                }
+            }
+
             // use the output as the source when it's not the first token-wise iteration
             s0 = s;
         }

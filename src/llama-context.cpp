@@ -106,6 +106,16 @@ llama_context::llama_context(
                         __func__, cparams.n_rs_seq);
         cparams.n_rs_seq = 0;
     }
+    // Fall back to full checkpoints until non-CUDA backends support Nemotron SSM snapshots.
+    if (cparams.n_rs_seq > 0 &&
+        (model.arch == LLM_ARCH_NEMOTRON_H || model.arch == LLM_ARCH_NEMOTRON_H_MOE)) {
+        auto * dev = model.devices.empty() ? nullptr : model.devices[0].dev;
+        auto * reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        if (reg == nullptr || strcmp(ggml_backend_reg_name(reg), "CUDA") != 0) {
+            LLAMA_LOG_DEBUG("%s: Nemotron SSM snapshots require CUDA; clamping n_rs_seq to 0\n", __func__);
+            cparams.n_rs_seq = 0;
+        }
+    }
 
     cparams.n_threads               = params.n_threads;
     cparams.n_threads_batch         = params.n_threads_batch;

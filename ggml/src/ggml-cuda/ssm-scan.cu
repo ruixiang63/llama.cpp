@@ -149,7 +149,8 @@ __global__ void __launch_bounds__(d_state, 1)
         const int src0_nb2, const int src0_nb3, const int src1_nb2, const int src1_nb3,
         const int src2_nb1, const int src2_nb2, const int src3_nb1,
         const int src4_nb2, const int src4_nb3, const int src5_nb2, const int src5_nb3,
-        const int64_t s_off, const int64_t n_head, const int64_t d_head, const int64_t n_group, const int64_t n_tok) {
+        const int64_t s_off, const int64_t n_head, const int64_t d_head, const int64_t n_group, const int64_t n_tok,
+        const int64_t K) {
     const float   * GGML_CUDA_RESTRICT src0 = src0_ptr;
     const float   * GGML_CUDA_RESTRICT src1 = src1_ptr;
     const float   * GGML_CUDA_RESTRICT src2 = src2_ptr;
@@ -195,6 +196,9 @@ __global__ void __launch_bounds__(d_state, 1)
         state[j] = s0_warp[WARP_SIZE * j + lane];
     }
 
+    // bytes between consecutive recurrent-state snapshots (one full state per sequence-group)
+    const int64_t snap_stride = (int64_t) gridDim.y * src0_nb3;
+
     for (int64_t i = 0; i < n_tok; i++) {
         // NOTE: dt_soft_plus, dA and x_dt have the same value for a warp here.
         // Recalculation is intentional; sharing via shuffles/smem proved slower due to sync overhead.
@@ -217,12 +221,17 @@ __global__ void __launch_bounds__(d_state, 1)
         if (lane == 0) {
             y_warp[i * stride_y] = state_sum;
         }
-    }
 
-    // write back the state
+        // write back the state, emitting the last K snapshots for bounded rollback
+        // (slot 0 = final state, slot b = state b tokens back)
+        const int64_t back = (n_tok - 1) - i;
+        if (back < K) {
+            float * s_snap = (float *) ((char *) s_warp + back * snap_stride);
 #pragma unroll
-    for (int j = 0; j < c_factor; j++) {
-        s_warp[WARP_SIZE * j + lane] = state[j];
+            for (int j = 0; j < c_factor; j++) {
+                s_snap[WARP_SIZE * j + lane] = state[j];
+            }
+        }
     }
 }
 
@@ -232,7 +241,7 @@ static void ssm_scan_f32_cuda(const float * src0, const float * src1, const floa
                               const int src2_nb2, const int src3_nb1, const int src4_nb2, const int src4_nb3, const int src5_nb2,
                               const int src5_nb3, const int64_t s_off, const int64_t d_state, const int64_t head_dim,
                               const int64_t n_head, const int64_t n_group, const int64_t n_tok, const int64_t n_seq,
-                              cudaStream_t stream) {
+                              const int64_t n_snapshots, cudaStream_t stream) {
     // NOTE: if you change conditions here, be sure to update the corresponding supports_op condition!
     if (src3_nb1 == sizeof(float)) {
         // Mamba-2
@@ -245,7 +254,7 @@ static void ssm_scan_f32_cuda(const float * src0, const float * src1, const floa
             ggml_cuda_kernel_launch(ssm_scan_f32_group<128/WARP_SIZE, 128>, launch_params,
                     src0, src1, src2, src3, src4, src5, src6, dst,
                     src0_nb2, src0_nb3, src1_nb2, src1_nb3, src2_nb1, src2_nb2, src3_nb1,
-                    src4_nb2, src4_nb3, src5_nb2, src5_nb3, s_off, n_head, head_dim, n_group, n_tok);
+                    src4_nb2, src4_nb3, src5_nb2, src5_nb3, s_off, n_head, head_dim, n_group, n_tok, n_snapshots);
         } else if (d_state == 256) { // Falcon-H1
             constexpr int threads   = 256;
             constexpr int num_warps = threads/WARP_SIZE;
@@ -255,12 +264,13 @@ static void ssm_scan_f32_cuda(const float * src0, const float * src1, const floa
             ggml_cuda_kernel_launch(ssm_scan_f32_group<256/WARP_SIZE, 256>, launch_params,
                     src0, src1, src2, src3, src4, src5, src6, dst,
                     src0_nb2, src0_nb3, src1_nb2, src1_nb3, src2_nb1, src2_nb2, src3_nb1,
-                    src4_nb2, src4_nb3, src5_nb2, src5_nb3, s_off, n_head, head_dim, n_group, n_tok);
+                    src4_nb2, src4_nb3, src5_nb2, src5_nb3, s_off, n_head, head_dim, n_group, n_tok, n_snapshots);
         } else {
             GGML_ABORT("doesn't support d_state!=(128 or 256).");
         }
     } else {
         // Mamba-1
+        GGML_ASSERT(n_snapshots == 1 && "recurrent-state rollback snapshots are not supported for Mamba-1 on CUDA");
         constexpr int threads = 128;
         GGML_ASSERT(n_head % threads == 0);
         GGML_ASSERT(head_dim == 1);
@@ -772,7 +782,12 @@ void ggml_cuda_op_ssm_scan(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     const int64_t s_off = ggml_nelements(src1) * sizeof(float);
 
-    GGML_ASSERT(ggml_nelements(src1) + nc*nr*nh*n_s == ggml_nelements(dst));
+    int64_t n_snapshots = ggml_get_op_params_i32(dst, 0);
+    if (n_snapshots < 1) {
+        n_snapshots = 1;
+    }
+
+    GGML_ASSERT(ggml_nelements(src1) + n_snapshots*nc*nr*nh*n_s == ggml_nelements(dst));
     GGML_ASSERT(src0->nb[0] == sizeof(float));
     GGML_ASSERT(src1->nb[0] == sizeof(float));
     GGML_ASSERT(src2->nb[0] == sizeof(float));
@@ -841,5 +856,5 @@ void ggml_cuda_op_ssm_scan(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ssm_scan_f32_cuda(src0_d, src1_d, src2_d, src3_d, src4_d, src5_d, src6_d, dst_d,
                       src0->nb[2], src0->nb[3], src1->nb[2], src1->nb[3], src2->nb[1], src2->nb[2],
                       src3->nb[1], src4->nb[2], src4->nb[3], src5->nb[2], src5->nb[3],
-                      s_off, nc, nr, nh, ng, n_t, n_s, stream);
+                      s_off, nc, nr, nh, ng, n_t, n_s, n_snapshots, stream);
 }
